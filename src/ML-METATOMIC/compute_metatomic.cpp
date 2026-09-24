@@ -11,6 +11,14 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+#include <metatomic/torch.hpp>
+// metatomic's C++ API uses nlohmann::json; point it at the copy bundled with
+// LAMMPS (renamed to nlohmann_lmp) instead of requiring a second copy
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+#include <metatomic.hpp>
+#include <metatensor/torch.hpp>
+
 #include "metatomic_types.h"
 #include "metatomic_system.h"
 #include "metatomic_quantities.h"
@@ -33,8 +41,6 @@
 #include <vector>
 #include <algorithm>
 
-#include <metatomic/torch.hpp>
-#include <metatensor/torch.hpp>
 
 using namespace LAMMPS_NS;
 
@@ -250,30 +256,29 @@ ComputeMetatomic::ComputeMetatomic(LAMMPS *lmp, int narg, char **arg): Compute(l
         this->extensions_directory ? this->extensions_directory->c_str() : nullptr
     );
 
-    auto capabilities = mta_data->model->run_method("capabilities").toCustomClass<metatomic_torch::ModelCapabilitiesHolder>();
+    auto capabilities = mta_data->model->capabilities();
     // validate that the model requests a supported dtype
     mta_data->model_dtype(lmp);
-    auto model_outputs = capabilities->outputs();
-    if (!model_outputs.contains(this->output_name)) {
+
+    auto model_outputs = capabilities.outputs();
+
+    auto it = std::find_if(std::cbegin(model_outputs), std::cend(model_outputs),
+        [this](const metatomic::Quantity& q) { return q.name() == this->output_name; });
+    if (it == model_outputs.end()) {
         error->all(FLERR,
             "the model does not provide an output named '" + this->output_name + "'"
         );
     }
-    auto sample_kind = model_outputs.at(this->output_name)->sample_kind();
-    this->mta_data->requested_output = torch::make_intrusive<metatomic_torch::ModelOutputHolder>(
-        /*quantity=*/"",
-        /*unit=*/unit,
-        /*sample_kind=*/sample_kind,
-        /*explicit_gradients=*/std::vector<std::string>{},
-        /*description=*/"Requested output from LAMMPS compute metatomic"
-    );
+    auto sample_kind = it->sample_kind();
+
+    this->mta_data->requested_output.push_back(metatomic::Quantity::Builder().name("").unit(unit).sample_kind(sample_kind).description("Requested output from LAMMPS compute metatomic").build());
     this->mta_data->evaluation_options->outputs.insert(this->output_name, this->mta_data->requested_output);
 
     // add the required additional inputs
     mta_data->requested_inputs = mta_data->collect_requested_inputs();
-    
+
     // Initialize the output layout
-    if (strcmp(sample_kind.c_str(), "atom") == 0) {
+    if (sample_kind == metatomic::SampleKind::Atom) {
         peratom_flag = 1;
         if (strcmp(shape.c_str(), "scalar") == 0) {
             result_kind = RESULT_PERATOM_SCALAR;
@@ -284,7 +289,7 @@ ComputeMetatomic::ComputeMetatomic(LAMMPS *lmp, int narg, char **arg): Compute(l
         } else {
             error->all(FLERR, "Illegal compute metatomic command: 'shape' must be 'scalar' or 'vector'");
         }
-    } else if (strcmp(sample_kind.c_str(), "system") == 0) {
+    } else if (sample_kind == metatomic::SampleKind::System) {
         if (strcmp(shape.c_str(), "scalar") == 0) {
             result_kind = RESULT_GLOBAL_SCALAR;
             scalar_flag = 1;
@@ -296,7 +301,16 @@ ComputeMetatomic::ComputeMetatomic(LAMMPS *lmp, int narg, char **arg): Compute(l
             error->all(FLERR, "Illegal compute metatomic command: 'shape' must be 'scalar' or 'vector'");
         }
     } else {
-        error->all(FLERR, "The requested output '" + this->output_name + "' has an unsupported sample kind '" + sample_kind + "'");
+        // TODO: better conversion of sample_kind to string for error message
+        auto to_str = [](metatomic::SampleKind kind) -> std::string {
+            switch (kind) {
+                case metatomic::SampleKind::Atom: return "atom";
+                case metatomic::SampleKind::System: return "system";
+                case metatomic::SampleKind::AtomPair: return "atom_pair";
+                default: return "unknown";
+            }
+        };
+        error->all(FLERR, "The requested output '" + this->output_name + "' has an unsupported sample kind '" + to_str(sample_kind) + "'");
     }
 
 
@@ -309,8 +323,8 @@ ComputeMetatomic::ComputeMetatomic(LAMMPS *lmp, int narg, char **arg): Compute(l
     );
 
     // move all data to the correct device
-    mta_data->model->to(mta_data->device);
-    mta_data->selected_atoms_values = mta_data->selected_atoms_values.to(mta_data->device);
+    //mta_data->model->to(mta_data->device);
+    //mta_data->selected_atoms_values = mta_data->selected_atoms_values.to(mta_data->device);
 }
 
 ComputeMetatomic::~ComputeMetatomic() {
@@ -330,7 +344,15 @@ ComputeMetatomic::~ComputeMetatomic() {
 }
 
 void ComputeMetatomic::init() {
-    auto message = "Computing " + this->output_name + " on " + mta_data->device.str() + " device with " + mta_data->capabilities->dtype() + " data";
+    // TODO: better conversion of dtype to string
+    auto to_str = [](const metatomic::ModelCapabilities::DType& dtype) -> std::string {
+        switch (dtype) {
+            case metatomic::ModelCapabilities::DType::Float32: return "float32";
+            case metatomic::ModelCapabilities::DType::Float64: return "float64";
+            default: return "unknown";
+        }
+    };
+    auto message = "Computing " + this->output_name + " on " + mta_data->device.str() + " device with " + to_str(mta_data->capabilities.dtype()) + " data";
     if (screen) {
         fprintf(screen, "%s\n", message.c_str());
     }
@@ -399,22 +421,23 @@ void ComputeMetatomic::compute() {
     mta_data->set_selected_atoms(atom, groupbit);
 
     // Call the ML model to predict the requested output
-    torch::IValue result_ivalue;
-    try {
-        result_ivalue = mta_data->model->forward({
-            std::vector<metatomic_torch::System>{system},
-            mta_data->evaluation_options,
-            mta_data->check_consistency
-        });
-    } catch (const std::exception& e) {
-        error->all(FLERR, "error evaluating the torch model: {}", e.what());
-    }
-
-    // Extract results from the model output
-    auto result = result_ivalue.toGenericDict();
-
-    // Extract requested output
-    auto output_map = result.at(this->output_name).toCustomClass<metatensor_torch::TensorMapHolder>();
+//     torch::IValue result_ivalue;
+//     try {
+//         result_ivalue = mta_data->model->forward({
+//             std::vector<metatomic::System>{std::move(system)},
+//             mta_data->evaluation_options,
+//             mta_data->check_consistency
+//         });
+//     } catch (const std::exception& e) {
+//         error->all(FLERR, "error evaluating the torch model: {}", e.what());
+//     }
+//
+//     // Extract results from the model output
+//     auto result = result_ivalue.toGenericDict();
+//
+//     // Extract requested output
+//     auto output_map = result.at(this->output_name).toCustomClass<metatensor_torch::TensorMapHolder>();
+    auto output_map = metatomic::execute_model(*(mta_data->model), std::vector<metatomic::System>{std::move(system)}, mta_data->selected_atoms_values, mta_data->requested_output, true);
     auto output_block = metatensor_torch::TensorMapHolder::block_by_id(output_map, 0);
     auto output_values = output_block->values().to(torch::kCPU).to(torch::kFloat64).contiguous();
 

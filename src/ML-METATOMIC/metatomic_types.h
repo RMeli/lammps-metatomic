@@ -14,10 +14,16 @@
 #include "lammps.h"
 
 #include <map>
+#include <metatomic/metadata.hpp>
 #include <string>
 
 #include <torch/torch.h>
 #include <metatensor/torch.hpp>
+// metatomic's C++ API uses nlohmann::json; point it at the copy bundled with
+// LAMMPS (renamed to nlohmann_lmp) instead of requiring a second copy
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+#include <metatomic.hpp>
 #include <metatomic/torch.hpp>
 
 
@@ -49,16 +55,16 @@ struct CommonMetatomicData {
    void set_selected_atoms(Atom* atom, int groupbit);
 
    // collect the additional inputs requested by the model
-   std::map<std::string, metatomic_torch::ModelOutput> collect_requested_inputs() const;
+   std::vector<metatomic::Quantity> collect_requested_inputs() const;
 
    // the metatomic model
-   std::unique_ptr<metatensor_torch::Module> model;
+   std::unique_ptr<metatomic::ExternalModel> model;
    // the path used to load the model
    std::string model_path;
    // device to use for the calculations
    torch::Device device;
    // model capabilities, declared by the model
-   metatomic_torch::ModelCapabilities capabilities;
+   metatomic::ModelCapabilities capabilities;
    // run-time evaluation options, decided by this class
    metatomic_torch::ModelEvaluationOptions evaluation_options;
 
@@ -90,8 +96,8 @@ struct PairMetatomicData: public CommonMetatomicData {
 
    // non-conservative forces/stress outputs we'll request from a model, or
    // nullptr if the model does not have such outputs
-   metatomic_torch::ModelOutput nc_forces_output;
-   metatomic_torch::ModelOutput nc_stress_output;
+   std::vector<metatomic::Quantity> nc_forces_output;
+   std::vector<metatomic::Quantity> nc_stress_output;
 
    // which non-conservative outputs to use
    enum class NonConservativeMode { OFF, ON, FORCES, STRESS };
@@ -114,9 +120,9 @@ struct FixMetatomicData: public CommonMetatomicData {
 struct ComputeMetatomicData: public CommonMetatomicData {
    ComputeMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)) {}
    // the inputs the model requested, and their corresponding holders
-   std::map<std::string, metatomic_torch::ModelOutput> requested_inputs;
+   std::vector<metatomic::Quantity> requested_inputs;
    // the output we'll request from a model
-   metatomic_torch::ModelOutput requested_output;
+   std::vector<metatomic::Quantity> requested_output;
 };
 
 }    // namespace LAMMPS_NS

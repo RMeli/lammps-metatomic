@@ -42,7 +42,11 @@
 #include <string>
 
 #include <metatensor/torch.hpp>
-#include <metatomic/torch.hpp>
+// metatomic's C++ API uses nlohmann::json; point it at the copy bundled with
+// LAMMPS (renamed to nlohmann_lmp) instead of requiring a second copy
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+#include <metatomic.hpp>
 
 #include "metatomic_system.h"
 #include "metatomic_timer.h"

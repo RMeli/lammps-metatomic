@@ -41,6 +41,9 @@ set(METATENSOR_CORE_SHA256 "61e9f894c7591c81b8aa4794fc48ee0be07264881cc2642bae31
 set(METATENSOR_TORCH_VERSION "0.10.0")
 set(METATENSOR_TORCH_SHA256 "a0a25e061ae4fbf2a563e9fcceed68ac79b4d857e4c9803a1614d301dc3fdfcd")
 
+set(METATOMIC_VERSION "0.1.0")
+#set(METATOMIC_SHA256 "2fa4c94144164168834a90ff195ed7d788959c9d9ffd3ea4a85e2f470925c708")
+
 set(METATOMIC_TORCH_VERSION "0.1.15")
 set(METATOMIC_TORCH_SHA256 "2fa4c94144164168834a90ff195ed7d788959c9d9ffd3ea4a85e2f470925c708")
 
@@ -51,8 +54,9 @@ if (metatensor_torch_FOUND)
 endif()
 
 set(DOWNLOAD_METATOMIC_DEFAULT ON)
+find_package(metatomic ${METATOMIC_VERSION} QUIET)
 find_package(metatomic_torch ${METATOMIC_TORCH_VERSION} QUIET)
-if (metatomic_torch_FOUND)
+if (metatomic_torch_FOUND AND metatomic_FOUND)
     set(DOWNLOAD_METATOMIC_DEFAULT OFF)
 endif()
 
@@ -97,10 +101,11 @@ if (DOWNLOAD_METATOMIC)
     FetchContent_MakeAvailable(metatomic-torch)
 else()
     # make sure to fail the configuration if cmake can not find metatomic-torch
+    find_package(metatomic ${METATOMIC_VERSION} REQUIRED)
     find_package(metatomic_torch ${METATOMIC_TORCH_VERSION} REQUIRED)
 endif()
 
 
 ################ lammps target modifications ################
 
-target_link_libraries(lammps PUBLIC metatomic_torch metatensor_torch)
+target_link_libraries(lammps PUBLIC metatomic metatomic_torch metatensor_torch)

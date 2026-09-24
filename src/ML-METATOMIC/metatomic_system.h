@@ -22,8 +22,12 @@
 #include "pair.h"
 #include "neigh_list.h"
 
-#include <metatomic/torch.hpp>
-
+// metatomic's C++ API uses nlohmann::json; point it at the copy bundled with
+// LAMMPS (renamed to nlohmann_lmp) instead of requiring a second copy
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+#include <metatomic.hpp>
+#include <metatomic/torch.hpp> // this included torch/script.h
 
 namespace LAMMPS_NS {
 
@@ -49,7 +53,7 @@ struct MetatomicNeighborsData {
     // cutoff for this NL in LAMMPS units
     double cutoff;
     // options of the NL as requested by the model
-    metatomic_torch::NeighborListOptions options;
+    metatomic::PairListOptions options;
 
     // Below are cached allocations for the LAMMPS -> metatomic NL translation
     // TODO: report memory usage for these?
@@ -67,29 +71,29 @@ public:
     virtual ~MetatomicSystemAdaptor();
 
     virtual void add_nl_request(
-        double cutoff, metatomic_torch::NeighborListOptions request
+        double cutoff, metatomic::PairListOptions request
     );
 
     virtual void configure_neighbor_lists(NeighRequest* request, CommonMetatomicData* mta_data, const char* requester);
 
     // Create a metatomic system matching the LAMMPS system data
-    virtual metatomic_torch::System system_from_lmp(
+    virtual metatomic::System system_from_lmp(
         NeighList* list,
         bool do_virial,
         torch::ScalarType dtype,
         torch::Device device,
-        const std::map<std::string, torch::intrusive_ptr<metatomic_torch::ModelOutputHolder>>& requested_inputs
+        const std::vector<metatomic::Quantity>& requested_inputs
     );
 
     // Add masses as extra data to this system, only for atoms which are not
     // periodic images of other atoms
-    virtual void add_masses(metatomic_torch::System& system, std::string name);
+    virtual void add_masses(metatomic::System& system, std::string name);
     // Add momenta as extra data to this system, only for atoms which are not
     // periodic images of other atoms
-    virtual void add_momenta(metatomic_torch::System& system, std::string name);
+    virtual void add_momenta(metatomic::System& system, std::string name);
     // Add velocities as extra data to this system, only for atoms which are not
     // periodic images of other atoms
-    virtual void add_velocities(metatomic_torch::System& system, std::string name);
+    virtual void add_velocities(metatomic::System& system, std::string name);
 
     // Explicit strain for virial calculations. This uses the same dtype/device
     // as LAMMPS data (positions, …)
@@ -103,7 +107,7 @@ public:
 
  protected:
     // setup the metatomic neighbors lists from the internal LAMMPS one,
-    void setup_neighbors(metatomic_torch::System& system, NeighList* list);
+    void setup_neighbors(metatomic::System& system, NeighList* list);
 
     // Some ghosts atoms correspond to periodic images of other atoms, we need
     // to identify them to avoid duplicated pairs in the neighbor lists.
