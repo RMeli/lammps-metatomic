@@ -14,6 +14,11 @@
 /* ----------------------------------------------------------------------
    Contributing authors: Guillaume Fraux <guillaume.fraux@epfl.ch>
 ------------------------------------------------------------------------- */
+// metatomic's C++ API uses nlohmann::json; point it at the copy bundled with
+// LAMMPS (renamed to nlohmann_lmp) instead of requiring a second copy
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+
 #include "pair_metatomic.h"
 #include "metatomic_types.h"
 
@@ -54,11 +59,11 @@ namespace nlohmann = ::nlohmann_lmp;
 
 using namespace LAMMPS_NS;
 
-static torch::optional<std::string> normalize_variant(const char* variant_string) {
+static std::optional<std::string> normalize_variant(const char* variant_string) {
     if (variant_string == nullptr) {
-        return torch::nullopt;
+        return std::nullopt;
     } else if (strcmp(variant_string, "off") == 0) {
-        return torch::nullopt;
+        return std::nullopt;
     } else {
         return std::string(variant_string);
     }
@@ -100,13 +105,13 @@ PairMetatomic::PairMetatomic(LAMMPS *lmp):
     this->manybody_flag = 1;
 
     // dynamic fusion strategy for torch::jit
-    torch::jit::FusionStrategy strategy = {{torch::jit::FusionBehavior::DYNAMIC, 10}};
-    torch::jit::setFusionStrategy(strategy);
+    // torch::jit::FusionStrategy strategy = {{torch::jit::FusionBehavior::DYNAMIC, 10}};
+    // torch::jit::setFusionStrategy(strategy);
 
     // disable some graph optimizations that can actually slow down model inference
-    const char* v = std::getenv("LAMMPS_METATOMIC_DISABLE_TORCH_JIT_OPTIMIZATION");
-    const bool disable = (v != nullptr) && (std::strcmp(v, "1") == 0);
-    if (disable) torch::jit::setGraphExecutorOptimize(false);
+    // const char* v = std::getenv("LAMMPS_METATOMIC_DISABLE_TORCH_JIT_OPTIMIZATION");
+    // const bool disable = (v != nullptr) && (std::strcmp(v, "1") == 0);
+    // if (disable) torch::jit::setGraphExecutorOptimize(false);
 }
 
 PairMetatomic::~PairMetatomic() {

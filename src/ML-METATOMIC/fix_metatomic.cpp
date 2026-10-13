@@ -23,6 +23,11 @@
    2. post_force: Snapshot forces (includes e.g. any added stochastic forces)
    3. final_integrate: Apply force corrections to velocities
 ------------------------------------------------------------------------- */
+// metatomic's C++ API uses nlohmann::json; point it at the copy bundled with
+// LAMMPS (renamed to nlohmann_lmp) instead of requiring a second copy
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+
 #include "metatomic_types.h"
 #include "metatomic_system.h"
 #include "metatomic_quantities.h"

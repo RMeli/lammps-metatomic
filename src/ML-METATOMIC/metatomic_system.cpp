@@ -177,7 +177,7 @@ void MetatomicSystemAdaptor::add_nl_request(double cutoff, metatomic::PairListOp
         error->one(FLERR,
             "model requested an invalid cutoff for neighbors list: {} "
             "(cutoff in model units is {})",
-            cutoff, request->cutoff()
+            cutoff, request.cutoff()
         );
     }
 
@@ -207,7 +207,7 @@ void MetatomicSystemAdaptor::configure_neighbor_lists(NeighRequest* request, Com
 
     // Translate from the metatomic neighbor lists requests to LAMMPS neighbor
     // lists requests.
-    auto requested_nl = mta_data->model->run_method("requested_neighbor_lists");
+    auto requested_nl = mta_data->model.requested_pair_lists();
     for (const auto& ivalue: requested_nl.toList()) {
         auto options = ivalue.get().toCustomClass<torch::intrusive_ptr<metatomic::PairListOptions>>();
         auto cutoff = options->engine_cutoff(mta_data->evaluation_options->length_unit());
@@ -405,8 +405,8 @@ void MetatomicSystemAdaptor::guess_periodic_ghosts() {
 
 void MetatomicSystemAdaptor::setup_neighbors(metatomic::System& system, NeighList *list) {
     auto _ = MetatomicTimer("converting neighbors list");
-    auto dtype = system->positions().scalar_type();
-    auto device = system->positions().device();
+    auto dtype = system.positions().scalar_type();
+    auto device = system.positions().device();
 
     double** x = atom->x;
     auto cell_inv = this->cell_inverse();
@@ -608,7 +608,7 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic::System& system, NeighLis
         }
 
         //metatomic_torch::register_autograd_neighbors(system, neighbors, options_.check_consistency);
-        system->add_pairs(nl.options, neighbors);
+        system.add_pairs(nl.options, neighbors);
     }
 }
 
@@ -709,8 +709,8 @@ void MetatomicSystemAdaptor::add_masses(metatomic::System& system, std::string n
 
     auto total_n_atoms = atom->nlocal + atom->nghost;
 
-    auto device = system->device();
-    auto dtype = system->scalar_type();
+    auto device = system.device();
+    auto dtype = system.scalar_type();
 
     auto mta_to_lmp_tensor = torch::from_blob(
         mta_to_lmp.data(),
@@ -753,7 +753,7 @@ void MetatomicSystemAdaptor::add_masses(metatomic::System& system, std::string n
     tensor->set_info("unit", unit);
 
     assert(name == "mass" || name == "masses");
-    system->add_data(name, tensor);
+    system.add_data(name, tensor);
 }
 
 
@@ -766,8 +766,8 @@ void MetatomicSystemAdaptor::add_momenta(metatomic::System& system, std::string 
 
     auto total_n_atoms = atom->nlocal + atom->nghost;
 
-    auto device = system->device();
-    auto dtype = system->scalar_type();
+    auto device = system.device();
+    auto dtype = system.scalar_type();
 
     auto mta_to_lmp_tensor = torch::from_blob(
         mta_to_lmp.data(),
@@ -809,7 +809,7 @@ void MetatomicSystemAdaptor::add_momenta(metatomic::System& system, std::string 
     tensor->set_info("unit", mass_unit + "*" + velocity_unit);
 
     assert(name == "momentum" || name == "momenta");
-    system->add_data(name, tensor);
+    system.add_data(name, tensor);
 }
 
 void MetatomicSystemAdaptor::add_velocities(metatomic::System& system, std::string name) {
@@ -817,8 +817,8 @@ void MetatomicSystemAdaptor::add_velocities(metatomic::System& system, std::stri
 
     auto total_n_atoms = atom->nlocal + atom->nghost;
 
-    auto device = system->device();
-    auto dtype = system->scalar_type();
+    auto device = system.device();
+    auto dtype = system.scalar_type();
 
     auto mta_to_lmp_tensor = torch::from_blob(
         mta_to_lmp.data(),
@@ -841,5 +841,5 @@ void MetatomicSystemAdaptor::add_velocities(metatomic::System& system, std::stri
     tensor->set_info("unit", unit);
 
     assert(name == "velocity" || name == "velocities");
-    system->add_data(name, tensor, /*override=*/true);
+    system.add_data(name, tensor, /*override=*/true);
 }

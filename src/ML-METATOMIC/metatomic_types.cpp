@@ -14,6 +14,11 @@
 /* ----------------------------------------------------------------------
    Contributing authors: Guillaume Fraux <guillaume.fraux@epfl.ch>
 ------------------------------------------------------------------------- */
+// metatomic's C++ API uses nlohmann::json; point it at the copy bundled with
+// LAMMPS (renamed to nlohmann_lmp) instead of requiring a second copy
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+
 #include "metatomic_types.h"
 
 #include "atom.h"
@@ -63,11 +68,11 @@ void CommonMetatomicData::load_model(
        lmp->error->one(FLERR, "failed to load metatomic model at '{}': {}", path, e.what());
    }
 
-   auto capabilities_ivalue = this->model->run_method("capabilities");
+   auto capabilities_ivalue = this->model.capabilities();
    this->capabilities = capabilities_ivalue.toCustomClass<metatomic_torch::ModelCapabilitiesHolder>();
 
    if (lmp->comm->me == 0) {
-       auto metadata_ivalue = this->model->run_method("metadata");
+       auto metadata_ivalue = this->model.metadata();
        auto metadata = metadata_ivalue.toCustomClass<metatomic_torch::ModelMetadataHolder>();
        auto to_print = metadata->print();
 
@@ -100,7 +105,7 @@ void CommonMetatomicData::pick_device(LAMMPS* lmp, const char* requested, const 
     torch::DeviceType device_type;
     try {
         device_type = metatomic_torch::pick_device(
-            this->capabilities->supported_devices,
+            this->capabilities().supported_devices(),
             requested_string
         );
     } catch (const c10::Error& e) {
@@ -150,7 +155,7 @@ c10::ScalarType CommonMetatomicData::model_dtype(LAMMPS* lmp) const {
 
 void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
     // get the model's interaction range
-    auto range = this->capabilities->engine_interaction_range(this->evaluation_options->length_unit());
+    auto range = this->capabilities().engine_interaction_range(this->evaluation_options->length_unit());
     if (range < 0) {
         lmp->error->all(FLERR, "interaction_range is negative for this model");
     } else if (!std::isfinite(range)) {
@@ -162,7 +167,7 @@ void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
         }
 
         // determine the maximal cutoff in the NL
-        auto requested_nl = this->model->run_method("requested_neighbor_lists");
+        auto requested_nl = this->model->requested_pair_lists());
         for (const auto& ivalue: requested_nl.toList()) {
             auto options = ivalue.get().toCustomClass<metatomic_torch::NeighborListOptionsHolder>();
             auto cutoff = options->engine_cutoff(this->evaluation_options->length_unit());
@@ -204,7 +209,7 @@ void CommonMetatomicData::set_selected_atoms(Atom* atom, int groupbit) {
 
 std::map<std::string, metatomic_torch::ModelOutput> CommonMetatomicData::collect_requested_inputs() const {
     std::map<std::string, metatomic_torch::ModelOutput> input_holders;
-    auto requested_inputs = this->model->run_method("requested_inputs", /*use_new_names=*/ true).toGenericDict();
+    auto requested_inputs = this->model->requested_inputs().toGenericDict();
     for (const auto& entry : requested_inputs) {
         input_holders.emplace(
             entry.key().toStringRef(),

@@ -99,7 +99,7 @@ public:
 
     void add_nl_request(
         double cutoff, metatomic_torch::NeighborListOptions request
-    ) override;
+    );
 
     // Create a metatensor system matching the LAMMPS-Kokkos system data
     metatomic_torch::System system_from_lmp(
@@ -108,11 +108,11 @@ public:
         torch::ScalarType dtype,
         torch::Device device,
         const std::map<std::string, torch::intrusive_ptr<metatomic_torch::ModelOutputHolder>>& requested_inputs
-    ) override;
+    );
 
-    void add_masses(metatomic_torch::System& system, std::string name) override;
-    void add_momenta(metatomic_torch::System& system, std::string name) override;
-    void add_velocities(metatomic_torch::System& system, std::string name) override;
+    void add_masses(metatomic_torch::System& system, std::string name);
+    void add_momenta(metatomic_torch::System& system, std::string name);
+    void add_velocities(metatomic_torch::System& system, std::string name);
 
     void setup_neighbors_kk(metatomic_torch::System& system, NeighListKokkos<DeviceType>* list);
 
