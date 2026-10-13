@@ -14,11 +14,13 @@
 #include "lammps.h"
 
 #include <map>
+#include <metatensor/dlpack/dlpack.h>
+#include <metatomic/model.hpp>
+#include <metatomic/utils.hpp>
 #include <string>
 
-#include <torch/torch.h>
 #include <metatensor/torch.hpp>
-#include <metatomic/torch.hpp>
+#include <metatomic.hpp>
 
 
 #ifndef LMP_METATOMIC_TYPES_H
@@ -38,7 +40,7 @@ struct CommonMetatomicData {
    void pick_device(LAMMPS* lmp, const char* requested, const char* cmd_name);
 
    // resolve the torch dtype (float32/float64) requested by the model
-   c10::ScalarType model_dtype(LAMMPS* lmp) const;
+   DLDataType model_dtype(LAMMPS* lmp) const;
 
    // compute `this->max_cutoff` from the model's interaction range, falling
    // back to the requested neighbor lists when the range is infinite
@@ -49,18 +51,18 @@ struct CommonMetatomicData {
    void set_selected_atoms(Atom* atom, int groupbit);
 
    // collect the additional inputs requested by the model
-   std::map<std::string, metatomic_torch::ModelOutput> collect_requested_inputs() const;
+   std::map<std::string, metatomic::Quantity> collect_requested_inputs() const;
 
    // the metatomic model
-   std::unique_ptr<metatensor_torch::Module> model;
+   std::unique_ptr<metatomic::ExternalModel> model;
    // the path used to load the model
    std::string model_path;
    // device to use for the calculations
-   torch::Device device;
+   DLDeviceType device;
    // model capabilities, declared by the model
-   metatomic_torch::ModelCapabilities capabilities;
-   // run-time evaluation options, decided by this class
-   metatomic_torch::ModelEvaluationOptions evaluation_options;
+   metatomic::ModelCapabilities capabilities;
+   // // run-time evaluation options, decided by this class
+   // metatomic_torch::ModelEvaluationOptions evaluation_options;
 
    // should metatomic check the data LAMMPS send to the model
    // and the data the model returns?
@@ -69,29 +71,29 @@ struct CommonMetatomicData {
    double max_cutoff = -1;
 
    // allocation cache for the selected atoms (device)
-   torch::Tensor selected_atoms_values;
+   metatomic::DLPackTensor selected_atoms_values;
    // allocation cache for the selected atoms (CPU)
-   torch::Tensor selected_atoms_values_cpu;
+   metatomic::DLPackTensor selected_atoms_values_cpu;
 };
 
 struct PairMetatomicData: public CommonMetatomicData {
-   PairMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)) {}
+   PairMetatomicData(std::string length_unit);
 
    // the energy output we'll request from a model
-   metatomic_torch::ModelOutput energy_output;
+   metatomic::Quantity energy_output;
    // wether the model capabilities say that it can do per-atom energies
    bool is_energy_output_per_atom = false;
 
    // energy uncertainty output we'll request from a model, or nullptr if the
    // model does not have such output
-   metatomic_torch::ModelOutput uncertainty_output;
+   metatomic::Quantity uncertainty_output;
    // threshold for energy uncertainty warnings
    double uncertainty_threshold = 0.0;
 
    // non-conservative forces/stress outputs we'll request from a model, or
    // nullptr if the model does not have such outputs
-   metatomic_torch::ModelOutput nc_forces_output;
-   metatomic_torch::ModelOutput nc_stress_output;
+   metatomic::Quantity nc_forces_output;
+   metatomic::Quantity nc_stress_output;
 
    // which non-conservative outputs to use
    enum class NonConservativeMode { OFF, ON, FORCES, STRESS };
@@ -107,17 +109,17 @@ struct PairMetatomicData: public CommonMetatomicData {
    std::string nc_stress_key;
 };
 
-struct FixMetatomicData: public CommonMetatomicData {
-   FixMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)) {}
-};
-
-struct ComputeMetatomicData: public CommonMetatomicData {
-   ComputeMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)) {}
-   // the inputs the model requested, and their corresponding holders
-   std::map<std::string, metatomic_torch::ModelOutput> requested_inputs;
-   // the output we'll request from a model
-   metatomic_torch::ModelOutput requested_output;
-};
+// struct FixMetatomicData: public CommonMetatomicData {
+//    FixMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)) {}
+// };
+//
+// struct ComputeMetatomicData: public CommonMetatomicData {
+//    ComputeMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)) {}
+//    // the inputs the model requested, and their corresponding holders
+//    std::map<std::string, metatomic::Quantity> requested_inputs;
+//    // the output we'll request from a model
+//    metatomic::Quantity requested_output;
+// };
 
 }    // namespace LAMMPS_NS
 

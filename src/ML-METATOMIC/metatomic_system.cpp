@@ -30,14 +30,22 @@
 #include "neigh_request.h"
 
 #include <map>
+#include <metatensor/dlpack/dlpack.h>
+#include <metatomic/metadata.hpp>
+#include <metatomic/utils.hpp>
 #include <string>
 
+#include <ATen/DLConvertor.h>
 #include <metatensor/torch.hpp>
 
 using namespace LAMMPS_NS;
 
 using vector_t = std::array<double, 3>;
 using matrix_t = std::array<std::array<double, 3>, 3>;
+
+// TODO RM
+constexpr DLDataType kDLFloat32{kDLFloat, 32, 1}; // float, 32 bits, non-vectorized
+constexpr DLDataType kDLFloat64{kDLFloat, 64, 1}; // float, 64 bits, non-vectorized
 
 static vector_t cross(vector_t a, vector_t b) {
     return {
@@ -152,19 +160,19 @@ MetatomicSystemAdaptor::MetatomicSystemAdaptor(LAMMPS *lmp, MetatomicSystemOptio
     Pointers(lmp),
     options_(std::move(options)),
     nl_requests_(),
-    atomic_types_(torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU)))
+    atomic_types_(at::toDLPackVersioned(torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU))))
 {
     auto tensor_options = torch::TensorOptions()
         .dtype(torch::kFloat64)
         .device(torch::kCPU)
         .requires_grad(options_.requires_grad);
 
-    this->strain = torch::eye(3, tensor_options);
+    this->strain = metatomic::DLPackTensor(at::toDLPackVersioned(torch::eye(3, tensor_options)));
 }
 
 MetatomicSystemAdaptor::~MetatomicSystemAdaptor() {}
 
-void MetatomicSystemAdaptor::add_nl_request(double cutoff, metatomic_torch::NeighborListOptions request) {
+void MetatomicSystemAdaptor::add_nl_request(double cutoff, const metatomic::PairListOptions& request) {
     if (cutoff > options_.interaction_range) {
         error->one(FLERR,
             "Invalid metatomic model: one of the requested neighbor lists "
@@ -175,7 +183,7 @@ void MetatomicSystemAdaptor::add_nl_request(double cutoff, metatomic_torch::Neig
         error->one(FLERR,
             "model requested an invalid cutoff for neighbors list: {} "
             "(cutoff in model units is {})",
-            cutoff, request->cutoff()
+            cutoff, request.cutoff()
         );
     }
 
@@ -205,13 +213,14 @@ void MetatomicSystemAdaptor::configure_neighbor_lists(NeighRequest* request, Com
 
     // Translate from the metatomic neighbor lists requests to LAMMPS neighbor
     // lists requests.
-    auto requested_nl = mta_data->model->run_method("requested_neighbor_lists");
-    for (const auto& ivalue: requested_nl.toList()) {
-        auto options = ivalue.get().toCustomClass<metatomic_torch::NeighborListOptionsHolder>();
-        auto cutoff = options->engine_cutoff(mta_data->evaluation_options->length_unit());
+    auto requested_nl = mta_data->model->requested_pair_lists();
+    for (const auto& pair_list_options: requested_nl) {
+        // TODO RM
+        //auto cutoff = options->engine_cutoff(mta_data->evaluation_options->length_unit());
+        auto cutoff = pair_list_options.cutoff();
         assert(cutoff <= mta_data->max_cutoff);
 
-        this->add_nl_request(cutoff, options);
+        this->add_nl_request(cutoff, pair_list_options);
     }
 
 }
@@ -315,7 +324,7 @@ void MetatomicSystemAdaptor::guess_periodic_ghosts() {
     // GPU) because ghost positions depend only on the original atom
     // position and exact cell-vector shifts — both of which are
     // order-independent. Picking the closest ghost also gives the most
-    // natural representative for cell-shift calculations.  
+    // natural representative for cell-shift calculations.
     double center[3];
     if (domain->triclinic == 0) {
         center[0] = 0.5 * (domain->sublo[0] + domain->subhi[0]);
@@ -401,10 +410,10 @@ void MetatomicSystemAdaptor::guess_periodic_ghosts() {
 }
 
 
-void MetatomicSystemAdaptor::setup_neighbors(metatomic_torch::System& system, NeighList *list) {
+void MetatomicSystemAdaptor::setup_neighbors(metatomic::System& system, NeighList *list) {
     auto _ = MetatomicTimer("converting neighbors list");
-    auto dtype = system->positions().scalar_type();
-    auto device = system->positions().device();
+    auto dtype = system.positions()->dl_tensor.dtype;
+    auto device = system.positions()->dl_tensor.device;
 
     double** x = atom->x;
     auto cell_inv = this->cell_inverse();
@@ -414,7 +423,7 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic_torch::System& system, Ne
             auto _ = MetatomicTimer("filtering LAMMPS neighbor list");
 
             auto cutoff2 = nl.cutoff * nl.cutoff;
-            auto full_list = nl.options->full_list();
+            auto full_list = nl.options.full_list();
 
             // convert from LAMMPS neighbors list to metatomic format
             nl.samples.clear();
@@ -527,9 +536,9 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic_torch::System& system, Ne
                         shift[2],
                     };
                     nl.samples.push_back(sample);
-                    if (dtype == torch::kFloat64) {
+                    if (dtype.code == kDLFloat && dtype.bits == 64 && dtype.lanes == 1) { // TODO RM
                         nl.distances_f64.push_back(distance);
-                    } else if (dtype == torch::kFloat32) {
+                    } else if (dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1) { // TODO RM
                         nl.distances_f32.push_back({
                             static_cast<float>(distance[0]),
                             static_cast<float>(distance[1]),
@@ -569,13 +578,13 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic_torch::System& system, Ne
         }
 
         auto distances_vectors = torch::Tensor();
-        if (dtype == torch::kFloat64) {
+        if (dtype.code == kDLFloat && dtype.bits == 64 && dtype.lanes == 1) { // TODO RM
             distances_vectors = torch::from_blob(
                 nl.distances_f64.data(),
                 {n_pairs, 3, 1},
                 torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU)
             );
-        } else if (dtype == torch::kFloat32) {
+        } else if (dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1) { // TODO RM
             distances_vectors = torch::from_blob(
                 nl.distances_f32.data(),
                 {n_pairs, 3, 1},
@@ -605,17 +614,18 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic_torch::System& system, Ne
             );
         }
 
-        metatomic_torch::register_autograd_neighbors(system, neighbors, options_.check_consistency);
-        system->add_neighbor_list(nl.options, neighbors);
+        // TODO RM
+        //metatomic_torch::register_autograd_neighbors(system, neighbors, options_.check_consistency);
+        system.add_pairs(nl.options, neighbors);
     }
 }
 
-metatomic_torch::System MetatomicSystemAdaptor::system_from_lmp(
+metatomic::System MetatomicSystemAdaptor::system_from_lmp(
     NeighList* list,
     bool do_virial,
-    torch::ScalarType dtype,
-    torch::Device device,
-    const std::map<std::string, torch::intrusive_ptr<metatomic_torch::ModelOutputHolder>>& requested_inputs
+    DLDataType dtype,
+    DLDeviceType device,
+    const std::map<std::string, metatomic::Quantity>& requested_inputs
 ) {
     auto _ = MetatomicTimer("creating System from LAMMPS data");
 
@@ -675,7 +685,7 @@ metatomic_torch::System MetatomicSystemAdaptor::system_from_lmp(
         cell = cell.matmul(model_strain);
     }
 
-    auto system = torch::make_intrusive<metatomic_torch::SystemHolder>(
+    auto system = metatomic::System(
         atomic_types_.to(device),
         system_positions,
         cell,
@@ -700,7 +710,7 @@ metatomic_torch::System MetatomicSystemAdaptor::system_from_lmp(
     return system;
 }
 
-void MetatomicSystemAdaptor::add_masses(metatomic_torch::System& system, std::string name) {
+void MetatomicSystemAdaptor::add_masses(metatomic::System& system, std::string name) {
     double* rmass = atom->rmass;
     double* mass = atom->mass;
     int* type = atom->type;
@@ -751,11 +761,11 @@ void MetatomicSystemAdaptor::add_masses(metatomic_torch::System& system, std::st
     tensor->set_info("unit", unit);
 
     assert(name == "mass" || name == "masses");
-    system->add_data(name, tensor);
+    system.add_custom_data(name, tensor);
 }
 
 
-void MetatomicSystemAdaptor::add_momenta(metatomic_torch::System& system, std::string name) {
+void MetatomicSystemAdaptor::add_momenta(metatomic::System& system, std::string name) {
     double* rmass = atom->rmass;
     double* mass = atom->mass;
     double** v = atom->v;
@@ -806,10 +816,10 @@ void MetatomicSystemAdaptor::add_momenta(metatomic_torch::System& system, std::s
     tensor->set_info("unit", mass_unit + "*" + velocity_unit);
 
     assert(name == "momentum" || name == "momenta");
-    system->add_data(name, tensor);
+    system.add_custom_data(name, tensor);
 }
 
-void MetatomicSystemAdaptor::add_velocities(metatomic_torch::System& system, std::string name) {
+void MetatomicSystemAdaptor::add_velocities(metatomic::System& system, std::string name) {
     double** v = atom->v;
 
     auto total_n_atoms = atom->nlocal + atom->nghost;
@@ -838,5 +848,5 @@ void MetatomicSystemAdaptor::add_velocities(metatomic_torch::System& system, std
     tensor->set_info("unit", unit);
 
     assert(name == "velocity" || name == "velocities");
-    system->add_data(name, tensor, /*override=*/true);
+    system.add_custom_data(name, tensor);
 }

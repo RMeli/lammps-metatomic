@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <metatensor/dlpack/dlpack.h>
+#include <metatomic/metadata.hpp>
 #include <torch/cuda.h>
 
 using namespace LAMMPS_NS;
@@ -33,9 +35,33 @@ CommonMetatomicData::CommonMetatomicData(std::string length_unit): device(torch:
     this->selected_atoms_values = torch::zeros({0, 2}, options);
     this->selected_atoms_values_cpu = torch::zeros({0, 2}, options);
 
-    // Initialize evaluation_options
-    this->evaluation_options = torch::make_intrusive<metatomic_torch::ModelEvaluationOptionsHolder>();
-    this->evaluation_options->set_length_unit(std::move(length_unit));
+}
+
+PairMetatomicData::PairMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)){
+    this->energy_output = metatomic::Quantity::builder()
+        .name("energy")
+        .unit("eV")
+        .sample_kind(metatomic::SampleKind::System)
+        .build();
+
+    this->uncertainty_output = metatomic::Quantity::builder()
+        .name("uncertainty")
+        .unit("eV")
+        .sample_kind(metatomic::SampleKind::System)
+        .build();
+
+    this->nc_forces_output = metatomic::Quantity::builder()
+        .name("nc_forces")
+        .unit("eV/angstrom")
+        .sample_kind(metatomic::SampleKind::System)
+        .build();
+
+    this->nc_stress_output = metatomic::Quantity::builder()
+        .name("nc_stress")
+        .unit("eV/angstrom^3")
+        .sample_kind(metatomic::SampleKind::System)
+        .build();
+
 }
 
 void CommonMetatomicData::load_model(
@@ -57,18 +83,18 @@ void CommonMetatomicData::load_model(
 
    try {
        this->model = std::make_unique<metatensor_torch::Module>(
-           metatomic_torch::load_atomistic_model(this->model_path, extensions)
+           metatomic::load_model(this->model_path, extensions)
        );
    } catch (const c10::Error& e) {
        lmp->error->one(FLERR, "failed to load metatomic model at '{}': {}", path, e.what());
    }
 
    auto capabilities_ivalue = this->model->run_method("capabilities");
-   this->capabilities = capabilities_ivalue.toCustomClass<metatomic_torch::ModelCapabilitiesHolder>();
+   this->capabilities = capabilities_ivalue.toCustomClass<metatomic::ModelCapabilities>();
 
    if (lmp->comm->me == 0) {
        auto metadata_ivalue = this->model->run_method("metadata");
-       auto metadata = metadata_ivalue.toCustomClass<metatomic_torch::ModelMetadataHolder>();
+       auto metadata = metadata_ivalue.toCustomClass<metatomic::ModelMetadata>();
        auto to_print = metadata->print();
 
        if (lmp->screen) {
@@ -136,16 +162,16 @@ void CommonMetatomicData::pick_device(LAMMPS* lmp, const char* requested, const 
     }
 }
 
-c10::ScalarType CommonMetatomicData::model_dtype(LAMMPS* lmp) const {
+DLDataType CommonMetatomicData::model_dtype(LAMMPS* lmp) const {
     const auto dtype = this->capabilities->dtype();
     if (dtype == "float64") {
-        return torch::kFloat64;
+        return DLDataType{kDLFloat, 64, 1};
     } else if (dtype == "float32") {
-        return torch::kFloat32;
+        return DLDataType{kDLFloat, 32, 1};
     } else {
         lmp->error->all(FLERR, "the model requested an unsupported dtype '{}'", dtype);
     }
-    return torch::kFloat64;  // unreachable, error->all does not return
+    return DLDataType{kDLFloat, 64, 1};  // unreachable, error->all does not return
 }
 
 void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
@@ -164,7 +190,7 @@ void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
         // determine the maximal cutoff in the NL
         auto requested_nl = this->model->run_method("requested_neighbor_lists");
         for (const auto& ivalue: requested_nl.toList()) {
-            auto options = ivalue.get().toCustomClass<metatomic_torch::NeighborListOptionsHolder>();
+            auto options = ivalue.get().toCustomClass<metatomic::PairListOptions>();
             auto cutoff = options->engine_cutoff(this->evaluation_options->length_unit());
             this->max_cutoff = std::max(this->max_cutoff, cutoff);
         }
@@ -173,42 +199,42 @@ void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
     }
 }
 
-void CommonMetatomicData::set_selected_atoms(Atom* atom, int groupbit) {
-    int nlocal = atom->nlocal;
-    int *mask = atom->mask;
+// void CommonMetatomicData::set_selected_atoms(Atom* atom, int groupbit) {
+//     int nlocal = atom->nlocal;
+//     int *mask = atom->mask;
+//
+//     int64_t n_selected = 0;
+//     for (int i = 0; i < nlocal; i++) {
+//         if (mask[i] & groupbit) {
+//             n_selected++;
+//         }
+//     }
+//     this->selected_atoms_values_cpu.resize_({n_selected, 2});
+//     auto accessor = this->selected_atoms_values_cpu.accessor<int32_t, 2>();
+//     int64_t idx = 0;
+//     for (int i = 0; i < nlocal; i++) {
+//         if (mask[i] & groupbit) {
+//             accessor[idx][0] = 0;
+//             accessor[idx][1] = i;
+//             idx++;
+//         }
+//     }
+//     this->selected_atoms_values.resize_({n_selected, 2});
+//     this->selected_atoms_values.copy_(this->selected_atoms_values_cpu);
+//
+//     auto selected_atoms = torch::make_intrusive<metatensor_torch::LabelsHolder>(
+//         std::vector<std::string>{"system", "atom"}, this->selected_atoms_values
+//     );
+//     this->evaluation_options->set_selected_atoms(selected_atoms);
+// }
 
-    int64_t n_selected = 0;
-    for (int i = 0; i < nlocal; i++) {
-        if (mask[i] & groupbit) {
-            n_selected++;
-        }
-    }
-    this->selected_atoms_values_cpu.resize_({n_selected, 2});
-    auto accessor = this->selected_atoms_values_cpu.accessor<int32_t, 2>();
-    int64_t idx = 0;
-    for (int i = 0; i < nlocal; i++) {
-        if (mask[i] & groupbit) {
-            accessor[idx][0] = 0;
-            accessor[idx][1] = i;
-            idx++;
-        }
-    }
-    this->selected_atoms_values.resize_({n_selected, 2});
-    this->selected_atoms_values.copy_(this->selected_atoms_values_cpu);
-
-    auto selected_atoms = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-        std::vector<std::string>{"system", "atom"}, this->selected_atoms_values
-    );
-    this->evaluation_options->set_selected_atoms(selected_atoms);
-}
-
-std::map<std::string, metatomic_torch::ModelOutput> CommonMetatomicData::collect_requested_inputs() const {
-    std::map<std::string, metatomic_torch::ModelOutput> input_holders;
+std::map<std::string, metatomic::Quantity> CommonMetatomicData::collect_requested_inputs() const {
+    std::map<std::string, metatomic::Quantity> input_holders;
     auto requested_inputs = this->model->run_method("requested_inputs", /*use_new_names=*/ true).toGenericDict();
     for (const auto& entry : requested_inputs) {
         input_holders.emplace(
             entry.key().toStringRef(),
-            entry.value().toCustomClass<metatomic_torch::ModelOutputHolder>()
+            entry.value().toCustomClass<metatomic::Quantity>()
         );
     }
     return input_holders;
