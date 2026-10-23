@@ -15,6 +15,7 @@
    Contributing authors: Guillaume Fraux <guillaume.fraux@epfl.ch>
 ------------------------------------------------------------------------- */
 #include "metatomic_system.h"
+#include "metatomic_dlpack.h"
 #include "metatomic_timer.h"
 #include "metatomic_types.h"
 #include "metatomic_quantities.h"
@@ -161,17 +162,23 @@ MetatomicSystemAdaptor::MetatomicSystemAdaptor(LAMMPS *lmp, MetatomicSystemOptio
     Pointers(lmp),
     options_(std::move(options)),
     nl_requests_(),
-    atomic_types_(at::toDLPackVersioned(torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU))))
 {
-    auto tensor_options = torch::TensorOptions()
-        .dtype(torch::kFloat64)
-        .device(torch::kCPU)
-        .requires_grad(options_.requires_grad);
-
-    this->strain = metatomic::DLPackTensor(at::toDLPackVersioned(torch::eye(3, tensor_options)));
+    this->strain_buffer_ = memory->create(this->strain_buffer_, 9, "", "metatomic:strain");
+    for(int i = 0; i < 3; i++){
+        for(int j = 0; j < 3; j++){
+            this->strain_buffer_[i*3+j] = (i==j) ? 1.0 : 0.0;
+        }
+    }
+    this->strain = mta::dlpack_view(this->strain_buffer_, {3, 3});
+    this->atomic_types_ = mta::dlpack_view(this->atomic_types_buffer_, {0});
 }
 
-MetatomicSystemAdaptor::~MetatomicSystemAdaptor() {}
+MetatomicSystemAdaptor::~MetatomicSystemAdaptor() {
+    memory->destroy(this->strain_buffer_);
+    memory->destroy(this->atomic_types_buffer_);
+    this->strain_buffer_ = nullptr;
+    this->atomic_types_buffer_ = nullptr;
+}
 
 void MetatomicSystemAdaptor::add_nl_request(double cutoff, const metatomic::PairListOptions& request) {
     if (cutoff > options_.interaction_range) {
@@ -249,52 +256,61 @@ static std::array<int32_t, 3> cell_shifts(
     return {shift_a, shift_b, shift_c};
 }
 
-static metatensor_torch::TensorMap make_per_atom_tensormap(
-    torch::Tensor values,
-    std::string property_name,
-    std::vector<std::string> component_names
+template <typename T>
+static metatensor::TensorMap make_per_atom_tensormap(
+    T *data,
+    std::vector<uintptr_t> shape,
+    const std::string &property_name,
+    const std::vector<std::string> &component_names
 ) {
-    assert (values.dim() == static_cast<int64_t>(component_names.size() + 1));
+    assert (shape.size() == component_names.size() + 1);
 
-    auto n_atoms = values.size(0);
-    auto device = values.device();
-    auto label_tensor_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+    auto n_atoms = shape[0];
 
-    auto keys = metatensor_torch::LabelsHolder::single()->to(device);
-    auto samples_values = torch::column_stack({
-        torch::zeros(n_atoms, label_tensor_options).unsqueeze(1),
-        torch::arange(n_atoms, label_tensor_options).unsqueeze(1)
-    });
-    auto samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
+    auto samples_values = std::vector<int32_t>(2 * n_atoms);
+    for (uintptr_t i = 0; i < n_atoms; i++) {
+        samples_values[2 * i] = 0;
+        samples_values[2 * i + 1] = static_cast<int32_t>(i);
+    }
+    auto samples = metatensor::Labels(
         std::vector<std::string>{"system", "atom"},
-        samples_values,
+        samples_values.data(), static_cast<size_t>(n_atoms),
         metatensor::assume_unique{}
     );
 
-    auto components = std::vector<metatensor_torch::Labels>{};
+    auto components = std::vector<metatensor::Labels>();
     for (size_t axis = 0; axis < component_names.size(); axis++) {
-        auto component_values = torch::arange(values.size(axis + 1), label_tensor_options).unsqueeze(1);
-        auto component = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-            std::vector<std::string>{std::move(component_names[axis])},
-            component_values
-        );
-        components.push_back(component);
+        auto m = shape[axis + 1];
+        auto entries = std::vector<int32_t>(m);
+        for (uintptr_t i = 0; i < m; i++) {
+            entries[i] = static_cast<int32_t>(i);
+        }
+        components.push_back(metatensor::Labels(
+            std::vector<std::string>{component_names[axis]},
+            entries.data(), static_cast<size_t>(m)
+        ));
     }
 
-    auto properties = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-        std::vector<std::string>{std::move(property_name)},
-        torch::tensor({{0}}, label_tensor_options)
-    );
-    auto block = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
-        values.unsqueeze(-1),
-        samples,
-        components,
-        properties
+    auto properties = metatensor::Labels(
+        std::vector<std::string>{std::move(property_name)}, {{0}}
     );
 
-    return torch::make_intrusive<metatensor_torch::TensorMapHolder>(
-        keys,
-        std::vector<metatensor_torch::TensorBlock>{block}
+    shape.push_back(1);
+    auto values = std::unique_ptr<metatensor::DataArrayBase>(
+        std::make_unique<mta::LmpDataArray<T>>(data, std::move(shape))
+    );
+
+    auto block = metatensor::TensorBlock(
+        std::move(values), samples, components, properties
+    );
+
+    auto blocks = std::vector<metatensor::TensorBlock>();
+    blocks.push_back(std::move(block));
+
+    return metatensor::TensorMap(
+        // LabelsHolder::single()
+        metatensor::Labels(std::vector<std::string>{"_"}, {{0}}),
+        std::move(blocks)
     );
 }
 

@@ -127,6 +127,10 @@ public:
     std::vector<MetatomicNeighborsData> nl_requests_;
     // allocation cache for the atomic types in the system
     metatomic::DLPackTensor atomic_types_;
+    int32_t* atomic_types_buffer_ = nullptr;
+
+    // LAMMPS strain buffer
+    double* strain_buffer_ = nullptr;
 
     // Original atom id for all atoms in the LAMMPS system.
     //

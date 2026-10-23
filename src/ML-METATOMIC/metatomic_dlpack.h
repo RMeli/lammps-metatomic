@@ -250,18 +250,19 @@ public:
 
     const std::vector<uintptr_t> &shape() const & override { return shape_; }
 
-    /// Set the shape of this array to the given shape. Only shapes with
-    /// the same number of elements are accepted.
-    void reshape(const std::vector<uintptr_t> &shape) override
+    void reshape(const std::vector<uintptr_t> & /*shape*/) override
     {
-        auto current = size_t{1};
-        for (auto d : shape_) current *= d;
-        auto requested = size_t{1};
-        for (auto d : shape) requested *= d;
-        if (current != requested) {
-            throw metatensor::Error("invalid shape in LmpDataArray::reshape");
-        }
-        shape_ = shape;
+        throw metatensor::Error("reshape is not supported for LmpDataArray views");
+    }
+
+    void swap_axes(uintptr_t /*axis_1*/, uintptr_t /*axis_2*/) override
+    {
+        throw metatensor::Error("swap_axes is not supported for LmpDataArray views");
+    }
+
+    void move_data(const DataArrayBase & /*input*/, std::vector<mts_data_movement_t> /*moves*/) override
+    {
+        throw metatensor::Error("move_data is not supported for LmpDataArray views");
     }
 
     metatensor::NDArray<T> view() const
