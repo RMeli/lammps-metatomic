@@ -37,6 +37,7 @@
 
 #include <ATen/DLConvertor.h>
 #include <metatensor/torch.hpp>
+#include <metatensor.hpp>
 
 using namespace LAMMPS_NS;
 
@@ -605,13 +606,13 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic::System& system, NeighLis
         metatensor::TensorBlock neighbors;
         {
             auto _ = MetatomicTimer("creating neighbors TensorBlock");
-            neighbors = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
+            neighbors = metatensor::TensorBlock(
                 distances_vectors,
                 samples,
                 std::vector<metatensor_torch::Labels>{
-                    metatensor_torch::LabelsHolder::create({"xyz"}, {{0}, {1}, {2}})->to(device),
+                    metatensor::Labels({"xyz"}, {{0}, {1}, {2}})/*->to(device)*/,
                 },
-                metatensor_torch::LabelsHolder::create({"distance"}, {{0}})->to(device)
+                metatensor::Labels({"distance"}, {{0}})/*->to(device)*/
             );
         }
 
@@ -718,8 +719,8 @@ void MetatomicSystemAdaptor::add_masses(metatomic::System& system, std::string n
 
     auto total_n_atoms = atom->nlocal + atom->nghost;
 
-    auto device = system->device();
-    auto dtype = system->scalar_type();
+    auto device = system.positions().as_dlpack()->dl_tensor.device;
+    auto dtype = system.positions().as_dlpack()->dl_tensor.dtype;
 
     auto mta_to_lmp_tensor = torch::from_blob(
         mta_to_lmp.data(),
@@ -849,5 +850,5 @@ void MetatomicSystemAdaptor::add_velocities(metatomic::System& system, std::stri
     tensor->set_info("unit", unit);
 
     assert(name == "velocity" || name == "velocities");
-    system.add_custom_data(name, tensor);
+    system.add_custom_data(name, at::toDLPackVersioned(tensor));
 }
