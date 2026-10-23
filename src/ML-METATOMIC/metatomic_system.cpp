@@ -413,7 +413,7 @@ void MetatomicSystemAdaptor::guess_periodic_ghosts() {
 void MetatomicSystemAdaptor::setup_neighbors(metatomic::System& system, NeighList *list) {
     auto _ = MetatomicTimer("converting neighbors list");
     auto dtype = system.positions()->dl_tensor.dtype;
-    auto device = system.positions()->dl_tensor.device;
+    auto device = system.types()->dl_tensor.device;
 
     double** x = atom->x;
     auto cell_inv = this->cell_inverse();
@@ -597,11 +597,12 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic::System& system, NeighLis
 
         {
             auto _ = MetatomicTimer("moving neighbor data to dtype/device");
-            distances_vectors = distances_vectors.to(dtype).to(device);
-            samples = samples->to(device);
+            // TODO RM
+            //distances_vectors = distances_vectors.to(dtype).to(device);
+            //samples = samples->to(device);
         }
 
-        torch::intrusive_ptr<metatensor_torch::TensorBlockHolder> neighbors;
+        metatensor::TensorBlock neighbors;
         {
             auto _ = MetatomicTimer("creating neighbors TensorBlock");
             neighbors = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
@@ -773,8 +774,8 @@ void MetatomicSystemAdaptor::add_momenta(metatomic::System& system, std::string 
 
     auto total_n_atoms = atom->nlocal + atom->nghost;
 
-    auto device = system->device();
-    auto dtype = system->scalar_type();
+    auto device = system.positions().as_dlpack()->dl_tensor.device;
+    auto dtype = system.types().as_dlpack()->dl_tensor.dtype;
 
     auto mta_to_lmp_tensor = torch::from_blob(
         mta_to_lmp.data(),
@@ -824,8 +825,8 @@ void MetatomicSystemAdaptor::add_velocities(metatomic::System& system, std::stri
 
     auto total_n_atoms = atom->nlocal + atom->nghost;
 
-    auto device = system->device();
-    auto dtype = system->scalar_type();
+    auto device = system.positions().as_dlpack()->dl_tensor.device;
+    auto dtype = system.types().as_dlpack()->dl_tensor.dtype;
 
     auto mta_to_lmp_tensor = torch::from_blob(
         mta_to_lmp.data(),
