@@ -37,10 +37,6 @@
 #include <metatomic/utils.hpp>
 #include <string>
 
-#include <ATen/DLConvertor.h>
-#include <metatensor/torch.hpp>
-#include <metatensor.hpp>
-
 using namespace LAMMPS_NS;
 
 using vector_t = std::array<double, 3>;
@@ -666,7 +662,6 @@ metatomic::System MetatomicSystemAdaptor::system_from_lmp(
     pbc_buffer_[2] = domain->zperiodic;
 
     // zero the cell rows of non-periodic directions
-    // cell.index_put_({torch::logical_not(pbc)}, torch::tensor({0.0}, tensor_options));
     if (!pbc_buffer_[0]) {
         cell_buffer_[0] = 0.0;
         cell_buffer_[1] = 0.0;
@@ -740,53 +735,40 @@ void MetatomicSystemAdaptor::add_masses(metatomic::System& system, std::string n
     double* mass = atom->mass;
     int* type = atom->type;
 
-    auto total_n_atoms = atom->nlocal + atom->nghost;
+    auto n_system_atoms = static_cast<int>(mta_to_lmp.size());
+    auto dtype = system.positions()->dl_tensor.dtype;
 
-    auto device = system.positions().as_dlpack()->dl_tensor.device;
-    auto dtype = system.positions().as_dlpack()->dl_tensor.dtype;
-
-    auto mta_to_lmp_tensor = torch::from_blob(
-        mta_to_lmp.data(),
-        {static_cast<int64_t>(mta_to_lmp.size())},
-        torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU)
-    );
-
-    // gather masses (per-atom) in a CPU tensor and ship to device
-    torch::Tensor masses;
-    auto cpu_float_tensor_options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
-    if (rmass) {
-        masses = torch::from_blob(
-            rmass,
-            {total_n_atoms},
-            torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU).requires_grad(false)
-        ).to(dtype);
-    } else {
-        // need to map from atom type to mass
-        masses = torch::empty({total_n_atoms}, cpu_float_tensor_options);
-        if (dtype == torch::kFloat64) {
-            auto masses_accessor = masses.accessor<double, 1>();
-            for (int i=0; i<total_n_atoms; i++) {
-                masses_accessor[i] = mass[type[i]];
-            }
-        } else if (dtype == torch::kFloat32) {
-            auto masses_accessor = masses.accessor<float, 1>();
-            for (int i=0; i<total_n_atoms; i++) {
-                masses_accessor[i] = static_cast<float>(mass[type[i]]);
-            }
-        } else {
-            error->one(FLERR, "invalid dtype, this is a bug");
+    // gather the masses of the atoms included in the metatomic system,
+    // converting to the system dtype on the fly. TODO RM: expand to GPU
+    if (dtype.code == kDLFloat && dtype.bits == 64 && dtype.lanes == 1) {
+        memory->grow(masses_f64_buffer_, n_system_atoms, "metatomic:masses_f64");
+        for (int i=0; i<n_system_atoms; i++) {
+            auto j = mta_to_lmp[i];
+            masses_f64_buffer_[i] = rmass ? rmass[j] : mass[type[j]];
         }
+        auto tensor = make_per_atom_tensormap(
+            masses_f64_buffer_, {static_cast<uintptr_t>(n_system_atoms)}, "mass", {}
+        );
+        auto unit = metatomic_unit_map.at("mass").at(update->unit_style);
+        tensor.set_info("unit", unit);
+        assert(name == "mass" || name == "masses");
+        system.add_custom_data(name, std::move(tensor));
+    } else if (dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1) {
+        memory->grow(masses_f32_buffer_, n_system_atoms, "metatomic:masses_f32");
+        for (int i=0; i<n_system_atoms; i++) {
+            auto j = mta_to_lmp[i];
+            masses_f32_buffer_[i] = static_cast<float>(rmass ? rmass[j] : mass[type[j]]);
+        }
+        auto tensor = make_per_atom_tensormap(
+            masses_f32_buffer_, {static_cast<uintptr_t>(n_system_atoms)}, "mass", {}
+        );
+        auto unit = metatomic_unit_map.at("mass").at(update->unit_style);
+        tensor.set_info("unit", unit);
+        assert(name == "mass" || name == "masses");
+        system.add_custom_data(name, std::move(tensor));
+    } else {
+        error->one(FLERR, "invalid dtype, this is a bug");
     }
-
-    masses = masses.index_select(0, mta_to_lmp_tensor);
-    masses = masses.to(device);
-    auto tensor = make_per_atom_tensormap(masses, "mass", std::vector<std::string>({}));
-
-    auto unit = metatomic_unit_map.at("mass").at(update->unit_style);
-    tensor->set_info("unit", unit);
-
-    assert(name == "mass" || name == "masses");
-    system.add_custom_data(name, tensor);
 }
 
 
@@ -796,82 +778,97 @@ void MetatomicSystemAdaptor::add_momenta(metatomic::System& system, std::string 
     double** v = atom->v;
     int* type = atom->type;
 
-    auto total_n_atoms = atom->nlocal + atom->nghost;
+    auto n_system_atoms = static_cast<int>(mta_to_lmp.size());
+    auto dtype = system.types()->dl_tensor.dtype;
 
-    auto device = system.positions().as_dlpack()->dl_tensor.device;
-    auto dtype = system.types().as_dlpack()->dl_tensor.dtype;
-
-    auto mta_to_lmp_tensor = torch::from_blob(
-        mta_to_lmp.data(),
-        {static_cast<int64_t>(mta_to_lmp.size())},
-        torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU)
-    );
-
-    // gather momenta (per-atom) in a CPU tensor and ship to device
-    torch::Tensor momenta = torch::empty(
-        {total_n_atoms, 3},
-        torch::TensorOptions().dtype(dtype).device(torch::kCPU)
-    );
-    if (dtype == torch::kFloat64) {
-        auto momenta_accessor = momenta.accessor<double, 2>();
-        for (int i=0; i<total_n_atoms; i++) {
-            double m = rmass ? rmass[i] : mass[type[i]];
-            momenta_accessor[i][0] = m * v[i][0];
-            momenta_accessor[i][1] = m * v[i][1];
-            momenta_accessor[i][2] = m * v[i][2];
+    // gather the momenta of the atoms included in the metatomic system,
+    // converting to the system dtype on the fly. TODO RM: expand to GPU
+    if (dtype.code == kDLFloat && dtype.bits == 64 && dtype.lanes == 1) {
+        memory->grow(momenta_f64_buffer_, 3 * n_system_atoms, "metatomic:momenta_f64");
+        for (int i=0; i<n_system_atoms; i++) {
+            auto j = mta_to_lmp[i];
+            double m = rmass ? rmass[j] : mass[type[j]];
+            momenta_f64_buffer_[3*i]   = m * v[j][0];
+            momenta_f64_buffer_[3*i+1] = m * v[j][1];
+            momenta_f64_buffer_[3*i+2] = m * v[j][2];
         }
-    } else if (dtype == torch::kFloat32) {
-        auto momenta_accessor = momenta.accessor<float, 2>();
-        for (int i=0; i<total_n_atoms; i++) {
-            double m = rmass ? rmass[i] : mass[type[i]];
-            momenta_accessor[i][0] = static_cast<float>(m * v[i][0]);
-            momenta_accessor[i][1] = static_cast<float>(m * v[i][1]);
-            momenta_accessor[i][2] = static_cast<float>(m * v[i][2]);
+        auto tensor = make_per_atom_tensormap(
+            momenta_f64_buffer_,
+            {static_cast<uintptr_t>(n_system_atoms), 3},
+            "momentum", {"xyz"}
+        );
+        auto mass_unit = metatomic_unit_map.at("mass").at(update->unit_style);
+        auto velocity_unit = metatomic_unit_map.at("velocity").at(update->unit_style);
+        tensor.set_info("unit", mass_unit + "*" + velocity_unit);
+        assert(name == "momentum" || name == "momenta");
+        system.add_custom_data(name, std::move(tensor));
+    } else if (dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1) {
+        memory->grow(momenta_f32_buffer_, 3 * n_system_atoms, "metatomic:momenta_f32");
+        for (int i=0; i<n_system_atoms; i++) {
+            auto j = mta_to_lmp[i];
+            double m = rmass ? rmass[j] : mass[type[j]];
+            momenta_f32_buffer_[3*i]   = static_cast<float>(m * v[j][0]);
+            momenta_f32_buffer_[3*i+1] = static_cast<float>(m * v[j][1]);
+            momenta_f32_buffer_[3*i+2] = static_cast<float>(m * v[j][2]);
         }
+        auto tensor = make_per_atom_tensormap(
+            momenta_f32_buffer_,
+            {static_cast<uintptr_t>(n_system_atoms), 3},
+            "momentum", {"xyz"}
+        );
+        auto mass_unit = metatomic_unit_map.at("mass").at(update->unit_style);
+        auto velocity_unit = metatomic_unit_map.at("velocity").at(update->unit_style);
+        tensor.set_info("unit", mass_unit + "*" + velocity_unit);
+        assert(name == "momentum" || name == "momenta");
+        system.add_custom_data(name, std::move(tensor));
     } else {
         error->one(FLERR, "invalid dtype, this is a bug");
     }
-
-    momenta = momenta.index_select(0, mta_to_lmp_tensor);
-    momenta = momenta.to(device);
-    auto tensor = make_per_atom_tensormap(momenta, "momentum", {"xyz"});
-
-    auto mass_unit = metatomic_unit_map.at("mass").at(update->unit_style);
-    auto velocity_unit = metatomic_unit_map.at("velocity").at(update->unit_style);
-    tensor->set_info("unit", mass_unit + "*" + velocity_unit);
-
-    assert(name == "momentum" || name == "momenta");
-    system.add_custom_data(name, tensor);
 }
 
 void MetatomicSystemAdaptor::add_velocities(metatomic::System& system, std::string name) {
     double** v = atom->v;
 
-    auto total_n_atoms = atom->nlocal + atom->nghost;
+    auto n_system_atoms = static_cast<int>(mta_to_lmp.size());
+    auto dtype = system.types()->dl_tensor.dtype;
 
-    auto device = system.positions().as_dlpack()->dl_tensor.device;
-    auto dtype = system.types().as_dlpack()->dl_tensor.dtype;
-
-    auto mta_to_lmp_tensor = torch::from_blob(
-        mta_to_lmp.data(),
-        {static_cast<int64_t>(mta_to_lmp.size())},
-        torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU)
-    );
-
-    // gather velocities (per-atom) in a CPU tensor and ship to device
-    auto velocities = torch::from_blob(
-        *v,
-        {total_n_atoms, 3},
-        torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU).requires_grad(false)
-    );
-
-    velocities = velocities.index_select(0, mta_to_lmp_tensor);
-    velocities = velocities.to(dtype).to(device);
-    auto tensor = make_per_atom_tensormap(velocities, "velocity", {"xyz"});
-
-    auto unit = metatomic_unit_map.at("velocity").at(update->unit_style);
-    tensor->set_info("unit", unit);
-
-    assert(name == "velocity" || name == "velocities");
-    system.add_custom_data(name, at::toDLPackVersioned(tensor));
+    // gather the velocities of the atoms included in the metatomic system,
+    // converting to the system dtype on the fly. TODO RM: expand to GPU
+    if (dtype.code == kDLFloat && dtype.bits == 64 && dtype.lanes == 1) {
+        memory->grow(velocities_f64_buffer_, 3 * n_system_atoms, "metatomic:velocities_f64");
+        for (int i=0; i<n_system_atoms; i++) {
+            auto j = mta_to_lmp[i];
+            velocities_f64_buffer_[3*i]   = v[j][0];
+            velocities_f64_buffer_[3*i+1] = v[j][1];
+            velocities_f64_buffer_[3*i+2] = v[j][2];
+        }
+        auto tensor = make_per_atom_tensormap(
+            velocities_f64_buffer_,
+            {static_cast<uintptr_t>(n_system_atoms), 3},
+            "velocity", {"xyz"}
+        );
+        auto unit = metatomic_unit_map.at("velocity").at(update->unit_style);
+        tensor.set_info("unit", unit);
+        assert(name == "velocity" || name == "velocities");
+        system.add_custom_data(name, std::move(tensor));
+    } else if (dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1) {
+        memory->grow(velocities_f32_buffer_, 3 * n_system_atoms, "metatomic:velocities_f32");
+        for (int i=0; i<n_system_atoms; i++) {
+            auto j = mta_to_lmp[i];
+            velocities_f32_buffer_[3*i]   = static_cast<float>(v[j][0]);
+            velocities_f32_buffer_[3*i+1] = static_cast<float>(v[j][1]);
+            velocities_f32_buffer_[3*i+2] = static_cast<float>(v[j][2]);
+        }
+        auto tensor = make_per_atom_tensormap(
+            velocities_f32_buffer_,
+            {static_cast<uintptr_t>(n_system_atoms), 3},
+            "velocity", {"xyz"}
+        );
+        auto unit = metatomic_unit_map.at("velocity").at(update->unit_style);
+        tensor.set_info("unit", unit);
+        assert(name == "velocity" || name == "velocities");
+        system.add_custom_data(name, std::move(tensor));
+    } else {
+        error->one(FLERR, "invalid dtype, this is a bug");
+    }
 }

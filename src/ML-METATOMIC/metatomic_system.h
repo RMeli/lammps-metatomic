@@ -150,6 +150,16 @@ public:
     float* positions_f32_buffer_ = nullptr;
     float cell_f32_buffer_[9] = {0};
 
+    // LAMMPS-Memory-owned staging buffers for the additional inputs (masses,
+    // momenta, velocities) requested by the model, gathered with `mta_to_lmp`
+    // and converted to the system dtype (f32 staging when needed).
+    double* masses_f64_buffer_ = nullptr;
+    float* masses_f32_buffer_ = nullptr;
+    double* momenta_f64_buffer_ = nullptr;
+    float* momenta_f32_buffer_ = nullptr;
+    double* velocities_f64_buffer_ = nullptr;
+    float* velocities_f32_buffer_ = nullptr;
+
     // Original atom id for all atoms in the LAMMPS system.
     //
     // This is the same as the atom id for all local atoms. For ghost atoms,
