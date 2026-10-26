@@ -25,6 +25,7 @@
 #include "domain.h"
 #include "error.h"
 #include "update.h"
+#include "memory.h"
 
 #include "neighbor.h"
 #include "neigh_list.h"
@@ -160,10 +161,9 @@ std::array<std::array<double, 3>, 3> MetatomicSystemAdaptor::cell_inverse() {
 
 MetatomicSystemAdaptor::MetatomicSystemAdaptor(LAMMPS *lmp, MetatomicSystemOptions options):
     Pointers(lmp),
-    options_(std::move(options)),
-    nl_requests_(),
+    options_(std::move(options))
 {
-    this->strain_buffer_ = memory->create(this->strain_buffer_, 9, "", "metatomic:strain");
+    this->strain_buffer_ = memory->create(this->strain_buffer_, 9, "metatomic:strain");
     for(int i = 0; i < 3; i++){
         for(int j = 0; j < 3; j++){
             this->strain_buffer_[i*3+j] = (i==j) ? 1.0 : 0.0;
@@ -570,71 +570,43 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic::System& system, NeighLis
         }
 
         int64_t n_pairs = nl.samples.size();
-        auto samples_values = torch::from_blob(
-            reinterpret_cast<int32_t*>(nl.samples.data()),
-            {n_pairs, 5},
-            torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU)
-        );
+        auto dimensions = std::vector<std::string>{
+            "first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"
+        };
+        auto values = reinterpret_cast<const int32_t*>(nl.samples.data());
+        auto samples = options_.check_consistency
+            ? metatensor::Labels(dimensions, values, n_pairs)
+            : metatensor::Labels(dimensions, values, n_pairs, metatensor::assume_unique{});
 
-        torch::intrusive_ptr<metatensor_torch::LabelsHolder> samples;
-        {
-            auto _ = MetatomicTimer("creating samples Labels (" +  std::to_string(n_pairs) + " pairs)");
-            if (options_.check_consistency) {
-                // pairs should be unique, but I'm not 100% sure yet
-                samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-                    std::vector<std::string>{"first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"},
-                    samples_values
-                );
-            } else {
-                samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-                    std::vector<std::string>{"first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"},
-                    samples_values,
-                    metatensor::assume_unique{}
-                );
-            }
-        }
-
-        auto distances_vectors = torch::Tensor();
+        std::unique_ptr<metatensor::DataArrayBase> distances_vectors;
         if (dtype.code == kDLFloat && dtype.bits == 64 && dtype.lanes == 1) { // TODO RM
-            distances_vectors = torch::from_blob(
-                nl.distances_f64.data(),
-                {n_pairs, 3, 1},
-                torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU)
+            distances_vectors = std::unique_ptr<metatensor::DataArrayBase>(
+                new mta::LmpDataArray<double>(
+                    reinterpret_cast<double*>(nl.distances_f64.data()),
+                    std::vector<uintptr_t>{n_pairs, 3, 1}
+                )
             );
         } else if (dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1) { // TODO RM
-            distances_vectors = torch::from_blob(
-                nl.distances_f32.data(),
-                {n_pairs, 3, 1},
-                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
+            distances_vectors = std::unique_ptr<metatensor::DataArrayBase>(
+                new mta::LmpDataArray<float>(
+                    reinterpret_cast<float*>(nl.distances_f32.data()),
+                    std::vector<uintptr_t>{n_pairs, 3, 1}
+                )
             );
         } else {
             // should be unreachable
             error->one(FLERR, "invalid dtype, this is a bug");
         }
 
-        {
-            auto _ = MetatomicTimer("moving neighbor data to dtype/device");
-            // TODO RM
-            //distances_vectors = distances_vectors.to(dtype).to(device);
-            //samples = samples->to(device);
-        }
-
-        metatensor::TensorBlock neighbors;
-        {
-            auto _ = MetatomicTimer("creating neighbors TensorBlock");
-            neighbors = metatensor::TensorBlock(
-                distances_vectors,
-                samples,
-                std::vector<metatensor_torch::Labels>{
-                    metatensor::Labels({"xyz"}, {{0}, {1}, {2}})/*->to(device)*/,
-                },
-                metatensor::Labels({"distance"}, {{0}})/*->to(device)*/
-            );
-        }
+        auto neighbors = metatensor::TensorBlock(
+            std::move(distances_vectors), samples,
+            std::vector<metatensor::Labels>{metatensor::Labels({"xyz"}, {{0}, {1}, {2}})},
+            metatensor::Labels({"distance"}, {{0}})
+        );
 
         // TODO RM
         //metatomic_torch::register_autograd_neighbors(system, neighbors, options_.check_consistency);
-        system.add_pairs(nl.options, neighbors);
+        system.add_pairs(nl.options, std::move(neighbors));
     }
 }
 
