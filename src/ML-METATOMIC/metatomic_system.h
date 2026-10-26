@@ -128,9 +128,27 @@ public:
     // allocation cache for the atomic types in the system
     metatomic::DLPackTensor atomic_types_;
     int32_t* atomic_types_buffer_ = nullptr;
+    int atomic_types_capacity_ = 0;
 
     // LAMMPS strain buffer
     double* strain_buffer_ = nullptr;
+
+    // LAMMPS-owned buffer for the gathered positions of the atoms included in
+    // the metatomic system (i.e. after dropping periodic-image duplicates),
+    // used to create the `positions` view. Grown with LAMMPS Memory as needed.
+    double* positions_buffer_ = nullptr;
+    int positions_buffer_capacity_ = 0;
+
+    // cell matrix of the metatomic system, row-major 3x3
+    double cell_buffer_[9] = {0};
+    // periodic boundary conditions of the metatomic system
+    bool pbc_buffer_[3] = {false, false, false};
+
+    // float32 staging buffers for the system positions and cell, used when the
+    // model requested float32 data (LAMMPS data is float64). These are
+    // LAMMPS-Memory-owned and grown as needed.
+    float* positions_f32_buffer_ = nullptr;
+    float cell_f32_buffer_[9] = {0};
 
     // Original atom id for all atoms in the LAMMPS system.
     //

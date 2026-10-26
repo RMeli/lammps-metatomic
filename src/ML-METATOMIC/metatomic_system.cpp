@@ -622,70 +622,105 @@ metatomic::System MetatomicSystemAdaptor::system_from_lmp(
     double** x = atom->x;
     auto total_n_atoms = atom->nlocal + atom->nghost;
 
-    atomic_types_.resize_({total_n_atoms});
+    // atomic types for all atoms (local + ghost), indexed by LAMMPS atom id
+    memory->grow(atomic_types_buffer_, total_n_atoms, "metatomic:atomic_types");
     for (int i=0; i<total_n_atoms; i++) {
-        atomic_types_[i] = options_.types_mapping[atom->type[i]];
+        atomic_types_buffer_[i] = options_.types_mapping[atom->type[i]];
     }
 
-    auto tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
-
-    // atom->x contains "real" and then ghost atoms, in that order
-    this->positions = torch::from_blob(*x, {total_n_atoms, 3}, tensor_options);
-
-    auto cell = torch::zeros({3, 3}, tensor_options);
-    cell[0][0] = domain->xprd;
-
-    cell[1][0] = domain->xy;
-    cell[1][1] = domain->yprd;
-
-    cell[2][0] = domain->xz;
-    cell[2][1] = domain->yz;
-    cell[2][2] = domain->zprd;
-
-    // Periodic boundary conditions handling.
-    auto pbc = torch::tensor(
-        {domain->xperiodic, domain->yperiodic, domain->zperiodic},
-        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU)
-    );
-
-    cell.index_put_({torch::logical_not(pbc)}, torch::tensor({0.0}, tensor_options));
-
+    // build the mta_to_lmp mapping (which atoms are included in the system)
     this->guess_periodic_ghosts();
 
-    // Only keep the atoms which are not periodic images of other atoms
-    auto mta_to_lmp_tensor = torch::from_blob(
-        mta_to_lmp.data(),
-        {static_cast<int64_t>(mta_to_lmp.size())},
-        torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU)
-    );
-    this->atomic_types_ = this->atomic_types_.index_select(0, mta_to_lmp_tensor);
-    this->positions = this->positions.index_select(0, mta_to_lmp_tensor);
-
-    this->positions.set_requires_grad(options_.requires_grad);
-
-    auto system_positions = this->positions.to(dtype).to(device);
-    cell = cell.to(dtype).to(device);
-
-    if (do_virial) {
-        auto model_strain = this->strain.to(dtype).to(device);
-
-        // scale positions/cell by the strain so that it enters the
-        // computational graph.
-        system_positions = system_positions.matmul(model_strain);
-        cell = cell.matmul(model_strain);
+    // gather the positions and atomic types of the atoms included in the
+    // metatomic system (i.e. dropping periodic-image duplicates)
+    auto n_system_atoms = static_cast<int>(mta_to_lmp.size());
+    memory->grow(positions_buffer_, 3 * n_system_atoms, "metatomic:positions");
+    for (int i=0; i<n_system_atoms; i++) {
+        auto j = mta_to_lmp[i];
+        positions_buffer_[3*i]   = x[j][0];
+        positions_buffer_[3*i+1] = x[j][1];
+        positions_buffer_[3*i+2] = x[j][2];
+    }
+    // mta_to_lmp is strictly increasing, so this in-place subset gather only
+    // reads entries that have not been overwritten yet
+    for (int i=0; i<n_system_atoms; i++) {
+        atomic_types_buffer_[i] = atomic_types_buffer_[mta_to_lmp[i]];
     }
 
+    // views over the LAMMPS-owned double buffers; these keep the LAMMPS data
+    // (before any dtype conversion) for gradient computations
+    this->positions = mta::dlpack_view(positions_buffer_, {n_system_atoms, 3});
+    this->atomic_types_ = mta::dlpack_view(atomic_types_buffer_, {n_system_atoms});
+
+    // cell matrix of the simulation box, row-major 3x3 with the cell vectors
+    // as rows: a = (xprd, 0, 0), b = (xy, yprd, 0), c = (xz, yz, zprd)
+    cell_buffer_[0] = domain->xprd;
+    cell_buffer_[3] = domain->xy;
+    cell_buffer_[4] = domain->yprd;
+    cell_buffer_[6] = domain->xz;
+    cell_buffer_[7] = domain->yz;
+    cell_buffer_[8] = domain->zprd;
+
+    pbc_buffer_[0] = domain->xperiodic;
+    pbc_buffer_[1] = domain->yperiodic;
+    pbc_buffer_[2] = domain->zperiodic;
+
+    // zero the cell rows of non-periodic directions
+    // cell.index_put_({torch::logical_not(pbc)}, torch::tensor({0.0}, tensor_options));
+    if (!pbc_buffer_[0]) {
+        cell_buffer_[0] = 0.0;
+        cell_buffer_[1] = 0.0;
+        cell_buffer_[2] = 0.0;
+    }
+    if (!pbc_buffer_[1]) {
+        cell_buffer_[3] = 0.0;
+        cell_buffer_[4] = 0.0;
+        cell_buffer_[5] = 0.0;
+    }
+    if (!pbc_buffer_[2]) {
+        cell_buffer_[6] = 0.0;
+        cell_buffer_[7] = 0.0;
+        cell_buffer_[8] = 0.0;
+    }
+
+    // build the views passed to the System, converting to the dtype requested
+    // by the model if needed. TODO RM: expand to GPU devices
+    metatomic::DLPackTensor types_tensor;
+    metatomic::DLPackTensor positions_tensor;
+    metatomic::DLPackTensor cell_tensor = mta::dlpack_view(cell_buffer_, {3, 3});
+    metatomic::DLPackTensor pbc_tensor = mta::dlpack_view(pbc_buffer_, {3});
+    if (dtype.code == kDLFloat && dtype.bits == 64 && dtype.lanes == 1) {
+        types_tensor = mta::dlpack_view(atomic_types_buffer_, {n_system_atoms});
+        positions_tensor = mta::dlpack_view(positions_buffer_, {n_system_atoms, 3});
+    } else if (dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1) {
+        memory->grow(positions_f32_buffer_, 3 * n_system_atoms, "metatomic:positions_f32");
+        for (int i=0; i<3*n_system_atoms; i++) {
+            positions_f32_buffer_[i] = static_cast<float>(positions_buffer_[i]);
+        }
+        for (int i=0; i<9; i++) {
+            cell_f32_buffer_[i] = static_cast<float>(cell_buffer_[i]);
+        }
+        types_tensor = mta::dlpack_view(atomic_types_buffer_, {n_system_atoms});
+        positions_tensor = mta::dlpack_view(positions_f32_buffer_, {n_system_atoms, 3});
+        cell_tensor = mta::dlpack_view(cell_f32_buffer_, {3, 3});
+    } else {
+        error->one(FLERR, "invalid dtype, this is a bug");
+    }
+
+    // TODO RM
+    (void) do_virial;
+
     auto system = metatomic::System(
-        atomic_types_.to(device),
-        system_positions,
-        cell,
-        pbc.to(device)
+        metatomic_unit_map.at("position").at(update->unit_style),
+        std::move(types_tensor),
+        std::move(positions_tensor),
+        std::move(cell_tensor),
+        std::move(pbc_tensor)
     );
 
     this->setup_neighbors(system, list);
 
     for (const auto& [name, input]: requested_inputs) {
-        const auto& unit = input->unit().c_str();
         if (name == "mass" || name == "masses") {
             add_masses(system, name);
         } else if (name == "momentum" || name == "momenta") {
