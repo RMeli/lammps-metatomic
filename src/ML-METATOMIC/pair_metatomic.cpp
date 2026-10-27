@@ -28,25 +28,17 @@
 
 #include "neigh_list.h"
 
-#include <torch/version.h>
-#include <torch/script.h>
-#include <torch/cuda.h>
-
-#if TORCH_VERSION_MAJOR >= 2
-    #include <torch/mps.h>
-#endif
-
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
-
-#include <metatensor/torch.hpp>
-#include <metatomic/torch.hpp>
-
 
 // TODO RM: fix nlohmann
 #include "json.h"
 namespace nlohmann = ::nlohmann_lmp;
+
+#include <metatomic/model.hpp>
+#include <metatensor.hpp>
 
 #include "metatomic_system.h"
 #include "metatomic_timer.h"
@@ -54,11 +46,11 @@ namespace nlohmann = ::nlohmann_lmp;
 
 using namespace LAMMPS_NS;
 
-static torch::optional<std::string> normalize_variant(const char* variant_string) {
+static std::optional<std::string> normalize_variant(const char* variant_string) {
     if (variant_string == nullptr) {
-        return torch::nullopt;
+        return std::nullopt;
     } else if (strcmp(variant_string, "off") == 0) {
-        return torch::nullopt;
+        return std::nullopt;
     } else {
         return std::string(variant_string);
     }
@@ -71,6 +63,42 @@ static double compute_volume(Domain* domain) {
     } else {
         return domain->xprd * domain->yprd;
     }
+}
+
+// Resolve the output key matching `name` or `name/variant` among the
+// model's outputs.
+// TODO RM: Move to metatomic?
+static std::string pick_output(
+    const std::string& name,
+    const std::vector<metatomic::Quantity>& outputs,
+    const std::optional<std::string>& variant
+) {
+    auto full_name = name;
+    if (variant.has_value() && !variant->empty()) {
+        full_name += "/" + variant.value();
+    }
+
+    for (const auto& output: outputs) {
+        if (output.name() == full_name) {
+            return output.name();
+        }
+    }
+
+    // no match: build the list of available variants for the error message
+    std::string available;
+    for (const auto& output: outputs) {
+        if (output.name().rfind(name + "/", 0) == 0) {
+            if (!available.empty()) {
+                available += ", ";
+            }
+            available += output.name();
+        }
+    }
+
+    throw std::runtime_error(
+        "no output named '" + full_name + "' in this model"
+        + (available.empty() ? "" : " (available: " + available + ")")
+    );
 }
 
 PairMetatomic::PairMetatomic(LAMMPS *lmp):
@@ -91,22 +119,13 @@ PairMetatomic::PairMetatomic(LAMMPS *lmp):
 
     this->mta_data = new PairMetatomicData(this->length_unit);
     // use a default uncertainty threshold of 100 meV/atom
-    this->mta_data->uncertainty_threshold = 0.1 * metatomic_torch::unit_conversion_factor("eV", energy_unit);
+    this->mta_data->uncertainty_threshold = 0.1 * metatomic::unit_conversion_factor("eV", energy_unit);
 
     // settings for metatomic pair style
     this->single_enable = 0;
     this->restartinfo = 0;
     this->one_coeff = 1;
     this->manybody_flag = 1;
-
-    // dynamic fusion strategy for torch::jit
-    torch::jit::FusionStrategy strategy = {{torch::jit::FusionBehavior::DYNAMIC, 10}};
-    torch::jit::setFusionStrategy(strategy);
-
-    // disable some graph optimizations that can actually slow down model inference
-    const char* v = std::getenv("LAMMPS_METATOMIC_DISABLE_TORCH_JIT_OPTIMIZATION");
-    const bool disable = (v != nullptr) && (std::strcmp(v, "1") == 0);
-    if (disable) torch::jit::setGraphExecutorOptimize(false);
 }
 
 PairMetatomic::~PairMetatomic() {
@@ -231,7 +250,7 @@ void PairMetatomic::settings(int argc, char ** argv) {
 
     // Load the model and get it's capabilities (including supported devices)
     mta_data->load_model(this->lmp, model_path, extensions_directory);
-    const auto& outputs = mta_data->capabilities->outputs();
+    const auto& outputs = mta_data->capabilities.outputs();
 
     // Set and resolve the variants to use
     auto v_energy = variant_energy ? normalize_variant(variant_energy) : normalize_variant(variant);
@@ -252,7 +271,7 @@ void PairMetatomic::settings(int argc, char ** argv) {
         // supports it
         bool has_uncertainty = false;
         for (const auto& output: outputs) {
-            if (output.key().find("energy_uncertainty") == 0) {
+            if (output.name().find("energy_uncertainty") == 0) {
                 has_uncertainty = true;
                 break;
             }
@@ -334,8 +353,10 @@ void PairMetatomic::settings(int argc, char ** argv) {
     }
 
     // Check that the model has the required outputs
-    auto energy_output = outputs.find(mta_data->energy_key);
-    if (energy_output == outputs.end()) {
+    const auto& outputs_vec = outputs;
+    auto energy_output = std::find_if(outputs_vec.begin(), outputs_vec.end(),
+        [&](const metatomic::Quantity& q) { return q.name() == mta_data->energy_key; });
+    if (energy_output == outputs_vec.end()) {
         lmp->error->one(FLERR,
             "the model at '{}' does not have an '{}' output, "
             "we can not use it with pair_style metatomic.",
@@ -343,64 +364,7 @@ void PairMetatomic::settings(int argc, char ** argv) {
         );
     }
 
-    mta_data->is_energy_output_per_atom = energy_output->value()->sample_kind() == "atom";
-    mta_data->energy_output = torch::make_intrusive<metatomic_torch::ModelOutputHolder>();
-    mta_data->energy_output->set_unit(this->energy_unit);
-
-    auto uncertainty_output = outputs.find(mta_data->energy_uq_key);
-    if (uncertainty_output != outputs.end()) {
-        if (do_uncertainty && (uncertainty_output->value()->sample_kind() == "atom")) {
-            // TODO: maybe if there is a global uncertainty output we should use
-            // that as a fallback?
-
-            mta_data->uncertainty_output = torch::make_intrusive<metatomic_torch::ModelOutputHolder>();
-            mta_data->uncertainty_output->set_unit(this->energy_unit);
-            mta_data->uncertainty_output->set_sample_kind("atom");
-
-            if (comm->me == 0) {
-                constexpr auto message = "Found '{}' output, we will check for atoms with high uncertainty on the energy predictions";
-                if (screen) {
-                    fprintf(screen, "%s\n", fmt::format(message, mta_data->energy_uq_key).c_str());
-                }
-                if (logfile) {
-                    fprintf(logfile,"%s\n", fmt::format(message, mta_data->energy_uq_key).c_str());
-                }
-            }
-        }
-    }
-
-    if (do_nc_forces) {
-        auto nc_forces = outputs.find(mta_data->nc_forces_key);
-        if (nc_forces == outputs.end()) {
-            error->one(FLERR,
-                "the model at '{}' does not have a '{}' output, "
-                "we can not enable non_conservative simulations",
-                model_path, mta_data->nc_forces_key
-            );
-        }
-
-        if (nc_forces->value()->sample_kind() != "atom") {
-            error->one(FLERR,
-                "the '{}' output of the model at '{}' "
-                "can not produce per-atom output, we can not enable non_conservative simulations",
-                mta_data->nc_forces_key, model_path
-            );
-        }
-        mta_data->nc_forces_output = torch::make_intrusive<metatomic_torch::ModelOutputHolder>();
-        mta_data->nc_forces_output->set_unit(this->energy_unit + "/" + this->length_unit);
-        mta_data->nc_forces_output->set_sample_kind("atom");
-    }
-
-    if (do_nc_stress) {
-        auto nc_stress = outputs.find(mta_data->nc_stress_key);
-        if (nc_stress != outputs.end()) {
-            mta_data->nc_stress_output = torch::make_intrusive<metatomic_torch::ModelOutputHolder>();
-            mta_data->nc_stress_output->set_unit(this->energy_unit + "/" + this->length_unit + "^3");
-            mta_data->nc_stress_output->set_sample_kind("system");
-        } else {
-            mta_data->nc_stress_output = nullptr;
-        }
-    }
+    mta_data->is_energy_output_per_atom = energy_output->sample_kind() == metatomic::SampleKind::Atom;
 
     // Check the user-requested device against the model's supported devices;
     // LAMMPS itself always runs on the CPU, moving data to/from a GPU is up
@@ -538,41 +502,44 @@ void PairMetatomic::compute(int eflag, int vflag) {
 
     ev_init(eflag, vflag);
 
-    mta_data->evaluation_options->outputs.clear();
     // we need an energy output if the energy was explicitly requested (through
     // `eflag_either`), or when running in standard/conservative mode, because
-    // we'll get the forces and stress as the gradient of the energy through autodiff.
-    auto need_energy_for_autograd = (nc_mode == NCMode::OFF
-                                  || nc_mode == NCMode::STRESS
-                                  || (nc_mode == NCMode::FORCES && vflag_global));
+    // we'll get the forces and stress as the gradient of the energy.
+    auto need_energy_gradient = (nc_mode == NCMode::OFF
+                              || nc_mode == NCMode::STRESS
+                              || (nc_mode == NCMode::FORCES && vflag_global));
 
     auto do_nc_forces = nc_mode == NCMode::ON || nc_mode == NCMode::FORCES;
     auto do_nc_stress = nc_mode == NCMode::ON || nc_mode == NCMode::STRESS;
 
-    if (eflag_either || need_energy_for_autograd) {
-        if (eflag_atom) {
-            if (!mta_data->is_energy_output_per_atom) {
-                error->one(FLERR,
-                    "the model at '{}' does not support per-atom 'energy' output",
-                    mta_data->model_path
-                );
-            }
-            mta_data->energy_output->set_sample_kind("atom");
-        } else {
-            mta_data->energy_output->set_sample_kind("system");
+    // build the list of outputs to request from the model: one Quantity per
+    // output, with explicit gradients on the energy when we need to derive
+    // forces/virial from it.
+    auto requested_outputs = std::vector<metatomic::Quantity>();
+    if (eflag_either || need_energy_gradient) {
+        auto energy_quantity = mta_data->energy_output;
+        if (need_energy_gradient) {
+            // TODO: how to add gradients to an existing Quantity? rebuild it
+            // from the builder with the requested gradients
+            energy_quantity = metatomic::Quantity::builder()
+                .name(energy_quantity.name())
+                .unit(energy_quantity.unit())
+                .sample_kind(metatomic::SampleKind::System)
+                .add_gradient(metatomic::Gradients::Positions)
+                .add_gradient(metatomic::Gradients::Strain)
+                .build();
         }
-        mta_data->evaluation_options->outputs.insert(mta_data->energy_key, mta_data->energy_output);
+        requested_outputs.push_back(energy_quantity);
     }
 
-    if (mta_data->uncertainty_output != nullptr) {
-        mta_data->evaluation_options->outputs.insert(mta_data->energy_uq_key, mta_data->uncertainty_output);
+    if (mta_data->uncertainty_threshold > 0) {
+        requested_outputs.push_back(mta_data->uncertainty_output);
     }
-
     if (do_nc_forces) {
-        mta_data->evaluation_options->outputs.insert(mta_data->nc_forces_key, mta_data->nc_forces_output);
+        requested_outputs.push_back(mta_data->nc_forces_output);
     }
-    if (vflag_global && do_nc_stress) {
-        mta_data->evaluation_options->outputs.insert(mta_data->nc_stress_key, mta_data->nc_stress_output);
+    if (do_nc_stress) {
+        requested_outputs.push_back(mta_data->nc_stress_output);
     }
 
     auto dtype = mta_data->model_dtype(lmp);
@@ -592,174 +559,81 @@ void PairMetatomic::compute(int eflag, int vflag) {
     // the all group (e.g. by fix_gcmc) are excluded.
     mta_data->set_selected_atoms(atom, 1);
 
-    torch::IValue results_ivalue;
-    try {
-        auto _ = MetatomicTimer("running Model::forward");
-        results_ivalue = mta_data->model->forward({
-            std::vector<metatomic_torch::System>{system},
-            mta_data->evaluation_options,
-            mta_data->check_consistency
-        });
-    } catch (const std::exception& e) {
-        error->one(FLERR, "error evaluating the torch model: {}", e.what());
-    }
+    // run the model: one TensorMap per requested output, in the same order
+    // as the requested_outputs vector.
+    auto systems = std::vector<metatomic::System>();
+    systems.push_back(std::move(system));
 
-    auto results = results_ivalue.toGenericDict();
-
-    // check the max uncertainty (only when the energy was actually requested: in
-    // non-conservative mode on steps without energy output, the model does not
-    // compute the energy or its uncertainty, so `energy_uq_key` is absent).
-    if (results.contains(mta_data->energy_uq_key)) {
-        auto uncertainty = results.at(mta_data->energy_uq_key).toCustomClass<metatensor_torch::TensorMapHolder>();
-        auto uncertainty_block = metatensor_torch::TensorMapHolder::block_by_id(uncertainty, 0);
-        assert(uncertainty_block->values().sizes().size() == 2);
-        assert(uncertainty_block->values().size(1) == 1);
-
-        auto atoms_above_thresholds = uncertainty_block->values().reshape({-1}) > mta_data->uncertainty_threshold;
-        if (torch::any(atoms_above_thresholds).to(torch::kCPU).item<bool>()) {
-            auto atoms = uncertainty_block->samples()->column("atom").index({atoms_above_thresholds});
-            std::ostringstream atoms_message;
-            atoms_message << "atoms at index [";
-
-            // only print the first 10 atoms above the threshold to avoid
-            // flooding the output
-            for (size_t i=0; i<std::min(static_cast<int64_t>(10), atoms.size(0)); i++) {
-                if (i > 0) {
-                    atoms_message << ", ";
-                }
-                atoms_message << atoms[i].item<int32_t>();
-            }
-            atoms_message << "]";
-
-            if (atoms.size(0) > 10) {
-                atoms_message << " and " << (atoms.size(0) - 10) << " more";
-            }
-
-            error->warning(FLERR,
-                "The uncertainty on atomic energies for {} are larger than "
-                "the threshold of {}. Be careful when analyzing the results, "
-                "and consider retraining the model to better describe these "
-                "configurations.",
-                atoms_message.str(), mta_data->uncertainty_threshold
+    auto results = std::vector<metatensor::TensorMap>();
+    {
+        auto _ = MetatomicTimer("running metatomic::execute_model");
+        try {
+            results = metatomic::execute_model(
+                *mta_data->model,
+                systems,
+                std::nullopt,  // TODO: selected_atoms from set_selected_atoms
+                requested_outputs,
+                mta_data->check_consistency
             );
+        } catch (const std::exception& e) {
+            error->one(FLERR, "error evaluating the metatomic model: {}", e.what());
         }
     }
 
-    torch::Tensor energy_tensor;
-    metatensor_torch::Labels energy_samples;
-
-    // get the energy if we need to compute the energy, or if we are using it to
-    // get the forces/virial with autograd
-    if (eflag_either || need_energy_for_autograd) {
-        auto energy = results.at(mta_data->energy_key).toCustomClass<metatensor_torch::TensorMapHolder>();
-        auto energy_block = metatensor_torch::TensorMapHolder::block_by_id(energy, 0);
-        energy_tensor = energy_block->values();
-        energy_samples = energy_block->samples();
+    if (results.empty()) {
+        error->one(FLERR, "the model at '{}' returned no outputs", mta_data->model_path);
     }
 
-    torch::Tensor forces_tensor;
-    torch::Tensor virial_tensor;
-
-    // get non-conservative forces
-    if (do_nc_forces) {
-        auto forces = results.at(mta_data->nc_forces_key).toCustomClass<metatensor_torch::TensorMapHolder>();
-        auto forces_block = metatensor_torch::TensorMapHolder::block_by_id(forces, 0);
-        forces_tensor = forces_block->values().squeeze(-1);
-        forces_tensor = forces_tensor.to(torch::kCPU).to(torch::kFloat64);
-    }
-
-    // get non-conservative stress
-    if (vflag_global && do_nc_stress) {
-        auto stress = results.at(mta_data->nc_stress_key).toCustomClass<metatensor_torch::TensorMapHolder>();
-        auto stress_block = metatensor_torch::TensorMapHolder::block_by_id(stress, 0);
-        auto stress_tensor = stress_block->values().squeeze(0).squeeze(-1);
-        virial_tensor = - stress_tensor * compute_volume(domain);
-        virial_tensor = virial_tensor.to(torch::kCPU).to(torch::kFloat64);
-    }
-
-    // compute conservative quantities through autograd
-    if (need_energy_for_autograd) {
-        this->system_adaptor->positions.mutable_grad() = torch::Tensor();
-        this->system_adaptor->strain.mutable_grad() = torch::Tensor();
-
-        auto _ = MetatomicTimer("running Model::backward");
-        energy_tensor.backward(-torch::ones_like(energy_tensor));
-
-        if (!do_nc_forces) {
-            forces_tensor = this->system_adaptor->positions.grad();
-        }
-        if (vflag_global && !do_nc_stress) {
-            virial_tensor = this->system_adaptor->strain.grad();
-        }
-    }
+    // the first requested output is always the energy (see the
+    // requested_outputs construction above)
+    auto& energy_map = results[0];
 
     {
         auto _ = MetatomicTimer("storing model output in LAMMPS data structures");
 
         // store the energy if requested
         if (eflag_either) {
-            // move results to cpu for storing
-            auto energy_detached = energy_tensor.detach().to(torch::kCPU).to(torch::kFloat64);
+            auto block = energy_map.block_by_id(0);
+            auto values = block.values<double>();  // DLPackArray<double>
 
             // store the energy returned by the model
             if (eflag_atom) {
-                assert(mta_data->energy_output->sample_kind() == "atom");
-                assert(energy_samples->size() == 2);
-                assert(energy_samples->names()[0] == "system");
-                assert(energy_samples->names()[1] == "atom");
+                auto samples = block.samples();
+                assert(samples.count() == values.shape()[0]);
 
-                auto samples_values = energy_samples->values().to(torch::kCPU);
-                auto samples = samples_values.accessor<int32_t, 2>();
-
-                assert(samples_values.sizes() == mta_data->selected_atoms_values.sizes());
-
-                auto energies = energy_detached.accessor<double, 2>();
                 const auto& mta_to_lmp = this->system_adaptor->mta_to_lmp;
-                for (int64_t i=0; i<energy_samples->count(); i++) {
-                    assert(samples[i][0] == 0);
-                    // handle potentially out of order samples in
-                    // the per-atom energy tensor
-                    auto atom_i = mta_to_lmp[samples[i][1]];
-                    assert(atom_i < atom->nlocal + atom->nghost);
-                    eatom[atom_i] += this->scale * energies[i][0];
+                const auto* raw = values.data();
+                for (size_t i=0; i<samples.count(); i++) {
+                    auto atom_i = mta_to_lmp[raw[i]];
+                    eatom[atom_i] += this->scale * raw[i];
                 }
             }
 
             if (eflag_global) {
-                torch::Tensor global_energy;
-                if (mta_data->energy_output->sample_kind() == "atom") {
-                    global_energy = energy_detached.sum(0);
-                    assert(energy_detached.sizes() == std::vector<int64_t>({1}));
-                } else {
-                    assert(energy_samples->size() == 1);
-                    assert(energy_samples->names()[0] == "system");
-
-                    assert(energy_detached.sizes() == std::vector<int64_t>({1, 1}));
-                    global_energy = energy_detached.reshape({1});
+                auto sum = 0.0;
+                const auto* raw = values.data();
+                auto n = values.shape()[0];
+                for (size_t i=0; i<n; i++) {
+                    sum += raw[i];
                 }
-
-                eng_vdwl += this->scale * global_energy.item<double>();
+                eng_vdwl += this->scale * sum;
             }
         }
 
-        // store forces/virial
-        this->store_forces(forces_tensor);
+        // store forces: either from the NC output directly, or from the
+        // gradient of the energy w.r.t. positions
+        std::vector<double> forces_buffer;
+        if (do_nc_forces) {
+            // TODO: read from the nc_forces TensorMap
+        } else if (need_energy_gradient) {
+            // TODO: read gradient("positions") and copy to forces_buffer
+        }
+        this->store_forces(forces_buffer.data(), forces_buffer.size() / 3);
 
         assert(!vflag_fdotr);
 
-        if (vflag_global && virial_tensor.defined()) {
-            auto virial_cpu = virial_tensor.to(torch::kCPU);
-            assert(virial_cpu.is_cpu() && virial_cpu.scalar_type() == torch::kFloat64);
-
-            auto predicted_virial = virial_cpu.template accessor<double, 2>();
-
-            virial[0] += this->scale * predicted_virial[0][0];
-            virial[1] += this->scale * predicted_virial[1][1];
-            virial[2] += this->scale * predicted_virial[2][2];
-
-            virial[3] += this->scale * 0.5 * (predicted_virial[1][0] + predicted_virial[0][1]);
-            virial[4] += this->scale * 0.5 * (predicted_virial[2][0] + predicted_virial[0][2]);
-            virial[5] += this->scale * 0.5 * (predicted_virial[2][1] + predicted_virial[1][2]);
+        if (vflag_global) {
+            // TODO: read the strain gradient / nc_stress block and fill virial
         }
 
         if (vflag_atom) {
@@ -768,25 +642,23 @@ void PairMetatomic::compute(int eflag, int vflag) {
     }
 }
 
-void PairMetatomic::store_forces(const at::Tensor& forces_tensor) {
-    assert(forces_tensor.is_cpu() && forces_tensor.scalar_type() == torch::kFloat64);
-
-    auto forces = forces_tensor.accessor<double, 2>();
-    for (int i=0; i<atom->nlocal; i++) {
-        atom->f[i][0] += this->scale * forces[i][0];
-        atom->f[i][1] += this->scale * forces[i][1];
-        atom->f[i][2] += this->scale * forces[i][2];
+void PairMetatomic::store_forces(const double* forces, uintptr_t n_atoms) {
+    for (uintptr_t i=0; i<n_atoms && i < static_cast<uintptr_t>(atom->nlocal); i++) {
+        atom->f[i][0] += this->scale * forces[3*i + 0];
+        atom->f[i][1] += this->scale * forces[3*i + 1];
+        atom->f[i][2] += this->scale * forces[3*i + 2];
     }
 
-    // ghost atom forces only exist when forces come from autograd
+    // ghost atom forces only exist when forces come from the energy gradient
     using NCMode = PairMetatomicData::NonConservativeMode;
     const auto nc_mode = mta_data->non_conservative;
     if (nc_mode == NCMode::OFF || nc_mode == NCMode::STRESS) {
         const auto& mta_to_lmp = this->system_adaptor->mta_to_lmp;
-        for (int i=atom->nlocal; i<forces.size(0); i++) {
-            atom->f[mta_to_lmp[i]][0] += this->scale * forces[i][0];
-            atom->f[mta_to_lmp[i]][1] += this->scale * forces[i][1];
-            atom->f[mta_to_lmp[i]][2] += this->scale * forces[i][2];
+        for (uintptr_t i=atom->nlocal; i<n_atoms; i++) {
+            auto atom_i = mta_to_lmp[i];
+            atom->f[atom_i][0] += this->scale * forces[3*i + 0];
+            atom->f[atom_i][1] += this->scale * forces[3*i + 1];
+            atom->f[atom_i][2] += this->scale * forces[3*i + 2];
         }
     }
 }

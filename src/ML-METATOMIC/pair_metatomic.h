@@ -34,14 +34,6 @@ PairStyle(metatomic_9, PairMetatomic);
 #include <memory>
 #include "pair.h"
 
-namespace c10 {
-    class Device;
-}
-
-namespace at {
-    class Tensor;
-}
-
 namespace LAMMPS_NS {
 class MetatomicSystemAdaptor;
 struct PairMetatomicData;
@@ -61,7 +53,7 @@ public:
     void allocate();
 
     // store the forces from the model in LAMMPS data structures
-    virtual void store_forces(const at::Tensor& forces_tensor);
+    virtual void store_forces(const double* forces, uintptr_t n_atoms);
 
 protected:
     PairMetatomicData* mta_data;
