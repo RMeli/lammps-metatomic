@@ -26,6 +26,9 @@
 #include <optional>
 #include <string>
 
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+
 #include <metatomic/metadata.hpp>
 #include <metatomic/plugin.hpp>
 
@@ -36,7 +39,7 @@ static std::string device_name(metatomic::ModelCapabilities::Device device) {
     switch (device) {
         case metatomic::ModelCapabilities::Device::CPU: return "cpu";
         case metatomic::ModelCapabilities::Device::CUDA: return "cuda";
-        case metatomic::ModelCapabilities::Device::ROCm: return "rocm";
+        case metatomic::ModelCapabilities::Device::ROCM: return "rocm";
         case metatomic::ModelCapabilities::Device::Metal: return "metal";
         default: return "cpu";
     }
@@ -54,32 +57,28 @@ CommonMetatomicData::CommonMetatomicData(std::string length_unit):
             .build()
     ) {}
 
-PairMetatomicData::PairMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)){
-    this->energy_output = metatomic::Quantity::builder()
+PairMetatomicData::PairMetatomicData(std::string length_unit):
+    CommonMetatomicData(std::move(length_unit)),
+    energy_output(metatomic::Quantity::builder()
         .name("energy")
         .unit("eV")
         .sample_kind(metatomic::SampleKind::System)
-        .build();
-
-    this->uncertainty_output = metatomic::Quantity::builder()
+        .build()),
+    uncertainty_output(metatomic::Quantity::builder()
         .name("uncertainty")
         .unit("eV")
         .sample_kind(metatomic::SampleKind::System)
-        .build();
-
-    this->nc_forces_output = metatomic::Quantity::builder()
+        .build()),
+    nc_forces_output(metatomic::Quantity::builder()
         .name("nc_forces")
         .unit("eV/angstrom")
         .sample_kind(metatomic::SampleKind::System)
-        .build();
-
-    this->nc_stress_output = metatomic::Quantity::builder()
+        .build()),
+    nc_stress_output(metatomic::Quantity::builder()
         .name("nc_stress")
         .unit("eV/angstrom^3")
         .sample_kind(metatomic::SampleKind::System)
-        .build();
-
-}
+        .build()) {}
 
 void CommonMetatomicData::load_model(
    LAMMPS* lmp,
@@ -112,19 +111,24 @@ void CommonMetatomicData::load_model(
        auto metadata = this->model->metadata();
 
        if (lmp->screen) {
-           fprintf(lmp->screen, "\n%s\n", metatomic::format_metadata(metadata.to_json()).c_str());
+           fprintf(lmp->screen, "\n%s\n", metadata.print().c_str());
        }
        if (lmp->logfile) {
-           fprintf(lmp->logfile,"\n%s\n", metatomic::format_metadata(metadata.to_json()).c_str());
+           fprintf(lmp->logfile,"\n%s\n", metadata.print().c_str());
        }
 
        // add the model references to LAMMPS citation handling mechanism
        if (lmp->citeme) {
-          for (const auto& it: metadata.references()) {
-             for (const auto& ref: it.second) {
-                lmp->citeme->add(ref + "\n");
-             }
-          }
+           const auto& references = metadata.references();
+           for (const auto& ref: references.model()) {
+               lmp->citeme->add(ref + "\n");
+           }
+           for (const auto& ref: references.architecture()) {
+               lmp->citeme->add(ref + "\n");
+           }
+           for (const auto& ref: references.implementation()) {
+               lmp->citeme->add(ref + "\n");
+           }
        }
    }
 }

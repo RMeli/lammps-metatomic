@@ -15,6 +15,11 @@
 
 #include <map>
 #include <metatensor/dlpack/dlpack.h>
+
+// TODO RM: fix nlohmann
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+
 #include <metatomic/model.hpp>
 #include <metatomic/utils.hpp>
 #include <string>
