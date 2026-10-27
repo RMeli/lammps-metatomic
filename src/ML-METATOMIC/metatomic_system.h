@@ -77,12 +77,13 @@ public:
 
     virtual void configure_neighbor_lists(NeighRequest* request, CommonMetatomicData* mta_data, const char* requester);
 
-    // Create a metatomic system matching the LAMMPS system data
+    // Create a metatomic system matching the LAMMPS system data. The data is
+    // always built on the CPU (LAMMPS owns CPU arrays); the model is
+    // responsible for moving it to/from the GPU if it runs on one.
     virtual metatomic::System system_from_lmp(
         NeighList* list,
         bool do_virial,
         DLDataType dtype,
-        DLDeviceType device,
         const std::map<std::string, metatomic::Quantity>& requested_inputs
     );
 

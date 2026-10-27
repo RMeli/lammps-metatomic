@@ -43,6 +43,11 @@
 #include <metatensor/torch.hpp>
 #include <metatomic/torch.hpp>
 
+
+// TODO RM: fix nlohmann
+#include "json.h"
+namespace nlohmann = ::nlohmann_lmp;
+
 #include "metatomic_system.h"
 #include "metatomic_timer.h"
 #include "metatomic_quantities.h"
@@ -397,21 +402,10 @@ void PairMetatomic::settings(int argc, char ** argv) {
         }
     }
 
-    // Select the device to use based on the model's preference, the user choice
-    // and what's available.
-    mta_data->pick_device(lmp, requested_device, "pair_style metatomic");
-
-    // move all data to the correct device
-    mta_data->model->to(mta_data->device);
-    mta_data->selected_atoms_values = mta_data->selected_atoms_values.to(mta_data->device);
-
-    auto message = "Running simulation on " + mta_data->device.str() + " device with " + mta_data->capabilities->dtype() + " data";
-    if (screen) {
-        fprintf(screen, "%s\n", message.c_str());
-    }
-    if (logfile) {
-        fprintf(logfile,"%s\n", message.c_str());
-    }
+    // Check the user-requested device against the model's supported devices;
+    // LAMMPS itself always runs on the CPU, moving data to/from a GPU is up
+    // to the model.
+    mta_data->check_requested_device(lmp, requested_device, "pair_style metatomic");
 
     if (!allocated) {
         allocate();
@@ -591,7 +585,6 @@ void PairMetatomic::compute(int eflag, int vflag) {
         mta_list,
         vflag_global && !do_nc_stress,
         dtype,
-        mta_data->device,
         input_holders
     );
 

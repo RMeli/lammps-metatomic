@@ -23,19 +23,36 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
+#include <string>
 
-#include <metatensor/dlpack/dlpack.h>
 #include <metatomic/metadata.hpp>
-#include <torch/cuda.h>
+#include <metatomic/plugin.hpp>
 
 using namespace LAMMPS_NS;
 
-CommonMetatomicData::CommonMetatomicData(std::string length_unit): device(torch::kCPU) {
-    auto options = torch::TensorOptions().dtype(torch::kInt32);
-    this->selected_atoms_values = torch::zeros({0, 2}, options);
-    this->selected_atoms_values_cpu = torch::zeros({0, 2}, options);
-
+// Name of a metatomic device, matching the strings used by metatomic
+static std::string device_name(metatomic::ModelCapabilities::Device device) {
+    switch (device) {
+        case metatomic::ModelCapabilities::Device::CPU: return "cpu";
+        case metatomic::ModelCapabilities::Device::CUDA: return "cuda";
+        case metatomic::ModelCapabilities::Device::ROCm: return "rocm";
+        case metatomic::ModelCapabilities::Device::Metal: return "metal";
+        default: return "cpu";
+    }
 }
+
+CommonMetatomicData::CommonMetatomicData(std::string length_unit):
+    capabilities(
+        metatomic::ModelCapabilities::builder()
+            .atomic_types({})
+            .interaction_range(-1)
+            .length_unit(length_unit)
+            .supported_devices({})
+            .dtype(metatomic::ModelCapabilities::DType::Float32)
+            .outputs({})
+            .build()
+    ) {}
 
 PairMetatomicData::PairMetatomicData(std::string length_unit): CommonMetatomicData(std::move(length_unit)){
     this->energy_output = metatomic::Quantity::builder()
@@ -76,38 +93,35 @@ void CommonMetatomicData::load_model(
        lmp->error->one(FLERR, "torch model is already loaded");
    }
 
-   torch::optional<std::string> extensions = torch::nullopt;
+   std::optional<std::string> extensions = std::nullopt;
    if (extensions_directory != nullptr) {
        extensions = std::string(extensions_directory);
    }
 
    try {
-       this->model = std::make_unique<metatensor_torch::Module>(
+       this->model = std::make_unique<metatomic::ExternalModel>(
            metatomic::load_model(this->model_path, extensions)
        );
-   } catch (const c10::Error& e) {
+   } catch (const metatomic::Error& e) {
        lmp->error->one(FLERR, "failed to load metatomic model at '{}': {}", path, e.what());
    }
 
-   auto capabilities_ivalue = this->model->run_method("capabilities");
-   this->capabilities = capabilities_ivalue.toCustomClass<metatomic::ModelCapabilities>();
+   this->capabilities = this->model->capabilities();
 
    if (lmp->comm->me == 0) {
-       auto metadata_ivalue = this->model->run_method("metadata");
-       auto metadata = metadata_ivalue.toCustomClass<metatomic::ModelMetadata>();
-       auto to_print = metadata->print();
+       auto metadata = this->model->metadata();
 
        if (lmp->screen) {
-           fprintf(lmp->screen, "\n%s\n", to_print.c_str());
+           fprintf(lmp->screen, "\n%s\n", metatomic::format_metadata(metadata.to_json()).c_str());
        }
        if (lmp->logfile) {
-           fprintf(lmp->logfile,"\n%s\n", to_print.c_str());
+           fprintf(lmp->logfile,"\n%s\n", metatomic::format_metadata(metadata.to_json()).c_str());
        }
 
        // add the model references to LAMMPS citation handling mechanism
        if (lmp->citeme) {
-          for (const auto& it: metadata->references) {
-             for (const auto& ref: it.value()) {
+          for (const auto& it: metadata.references()) {
+             for (const auto& ref: it.second) {
                 lmp->citeme->add(ref + "\n");
              }
           }
@@ -115,68 +129,51 @@ void CommonMetatomicData::load_model(
    }
 }
 
-void CommonMetatomicData::pick_device(LAMMPS* lmp, const char* requested, const char* cmd_name) {
-    torch::optional<std::string> requested_string;
-    if (requested != nullptr) {
-        requested_string = std::string(requested);
-    } else {
-        requested_string = torch::nullopt;
+void CommonMetatomicData::check_requested_device(LAMMPS* lmp, const char* requested, const char* cmd_name) const {
+    // The data LAMMPS builds for the model is on the CPU.
+    // Moving it to/from the GPU is up to the model itself.
+    if (requested == nullptr) {
+        return;
     }
 
-    torch::DeviceType device_type;
-    try {
-        device_type = metatomic_torch::pick_device(
-            this->capabilities->supported_devices,
-            requested_string
-        );
-    } catch (const c10::Error& e) {
-        lmp->error->one(FLERR, "{}: {}", cmd_name, e.what());
-    }
+    auto wanted = std::string(requested);
+    auto supported = this->capabilities.supported_devices();
+    auto it = std::find_if(supported.begin(), supported.end(), [&](const auto& d) {
+        return device_name(d) == wanted;
+    });
 
-    if (device_type == torch::DeviceType::CUDA) {
-        // distribute GPUs between multiple MPI processes on the same node
-
-        // (1) get a MPI communicator for all processes on the current node
-        MPI_Comm local;
-        MPI_Comm_split_type(lmp->world, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &local);
-        // (2) get the rank of this MPI process on the current node
-        int local_rank;
-        MPI_Comm_rank(local, &local_rank);
-
-        int size;
-        MPI_Comm_size(local, &size);
-        if (size < torch::cuda::device_count()) {
-            if (lmp->comm->me == 0) {
-                lmp->error->warning(FLERR,
-                    "found {} CUDA-capable GPUs, but only {} MPI processes on the current node; the remaining GPUs will not be used",
-                    torch::cuda::device_count(), size
-                );
+    // device not supported
+    if (it == supported.end()) {
+        std::string supported_names;
+        for (const auto& d: supported) {
+            if (!supported_names.empty()) {
+                supported_names += ", ";
             }
+            supported_names += device_name(d);
         }
-
-        // (3) split GPUs between node-local processes using round-robin allocation
-        auto device_index = local_rank % torch::cuda::device_count();
-        this->device = torch::Device(device_type, static_cast<torch::DeviceIndex>(device_index));
-    } else {
-        this->device = torch::Device(device_type);
+        lmp->error->one(FLERR,
+            "{}: the model does not support the requested device '{}'; supported devices are: {}",
+            cmd_name, wanted, supported_names
+        );
     }
 }
 
 DLDataType CommonMetatomicData::model_dtype(LAMMPS* lmp) const {
-    const auto dtype = this->capabilities->dtype();
-    if (dtype == "float64") {
+    const auto dtype = this->capabilities.dtype();
+    if (dtype == metatomic::ModelCapabilities::DType::Float64) {
         return DLDataType{kDLFloat, 64, 1};
-    } else if (dtype == "float32") {
+    } else if (dtype == metatomic::ModelCapabilities::DType::Float32) {
         return DLDataType{kDLFloat, 32, 1};
     } else {
-        lmp->error->all(FLERR, "the model requested an unsupported dtype '{}'", dtype);
+        lmp->error->all(FLERR, "the model requested an unsupported dtype");
     }
     return DLDataType{kDLFloat, 64, 1};  // unreachable, error->all does not return
 }
 
 void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
-    // get the model's interaction range
-    auto range = this->capabilities->engine_interaction_range(this->evaluation_options->length_unit());
+    // get the model's interaction range in the model length unit
+    auto range = this->capabilities.interaction_range();
+    // TODO RM: convert the interaction range to LAMMPS units
     if (range < 0) {
         lmp->error->all(FLERR, "interaction_range is negative for this model");
     } else if (!std::isfinite(range)) {
@@ -188,10 +185,8 @@ void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
         }
 
         // determine the maximal cutoff in the NL
-        auto requested_nl = this->model->run_method("requested_neighbor_lists");
-        for (const auto& ivalue: requested_nl.toList()) {
-            auto options = ivalue.get().toCustomClass<metatomic::PairListOptions>();
-            auto cutoff = options->engine_cutoff(this->evaluation_options->length_unit());
+        for (const auto& options: this->model->requested_pair_lists()) {
+            auto cutoff = options.cutoff();
             this->max_cutoff = std::max(this->max_cutoff, cutoff);
         }
     } else {
@@ -230,12 +225,8 @@ void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
 
 std::map<std::string, metatomic::Quantity> CommonMetatomicData::collect_requested_inputs() const {
     std::map<std::string, metatomic::Quantity> input_holders;
-    auto requested_inputs = this->model->run_method("requested_inputs", /*use_new_names=*/ true).toGenericDict();
-    for (const auto& entry : requested_inputs) {
-        input_holders.emplace(
-            entry.key().toStringRef(),
-            entry.value().toCustomClass<metatomic::Quantity>()
-        );
+    for (const auto& quantity: this->model->requested_inputs()) {
+        input_holders.emplace(quantity.name(), quantity);
     }
     return input_holders;
 }

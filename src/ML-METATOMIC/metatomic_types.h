@@ -19,10 +19,6 @@
 #include <metatomic/utils.hpp>
 #include <string>
 
-#include <metatensor/torch.hpp>
-#include <metatomic.hpp>
-
-
 #ifndef LMP_METATOMIC_TYPES_H
 #define LMP_METATOMIC_TYPES_H
 
@@ -34,10 +30,8 @@ struct CommonMetatomicData {
    CommonMetatomicData(std::string length_unit);
    void load_model(LAMMPS* lmp, const char* path, const char* extensions_directory);
 
-   // pick the compute device from the model's supported devices and the user
-   // request (or nullptr), storing the result in `this->device`. `cmd_name` is
-   // used as a prefix in error messages (e.g. "pair_style metatomic").
-   void pick_device(LAMMPS* lmp, const char* requested, const char* cmd_name);
+   // check device requested by the user against the supported devices
+   void check_requested_device(LAMMPS* lmp, const char* requested, const char* cmd_name) const;
 
    // resolve the torch dtype (float32/float64) requested by the model
    DLDataType model_dtype(LAMMPS* lmp) const;
@@ -57,8 +51,6 @@ struct CommonMetatomicData {
    std::unique_ptr<metatomic::ExternalModel> model;
    // the path used to load the model
    std::string model_path;
-   // device to use for the calculations
-   DLDeviceType device;
    // model capabilities, declared by the model
    metatomic::ModelCapabilities capabilities;
    // // run-time evaluation options, decided by this class

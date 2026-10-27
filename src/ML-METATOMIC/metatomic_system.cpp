@@ -610,7 +610,6 @@ metatomic::System MetatomicSystemAdaptor::system_from_lmp(
     NeighList* list,
     bool do_virial,
     DLDataType dtype,
-    DLDeviceType device,
     const std::map<std::string, metatomic::Quantity>& requested_inputs
 ) {
     auto _ = MetatomicTimer("creating System from LAMMPS data");
