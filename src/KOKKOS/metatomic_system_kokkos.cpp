@@ -16,659 +16,659 @@
                          Filippo Bigi <filippo.bigi@epfl.ch>
 ------------------------------------------------------------------------- */
 
-#include "metatomic_system_kokkos.h"
-#include "memory_kokkos.h"
-#include "metatomic_timer.h"
-#include "metatomic_quantities.h"
-
-#include "atom_masks.h"
-#include "atom_kokkos.h"
-#include "comm.h"
-#include "domain.h"
-#include "error.h"
-#include "update.h"
-
-#include <torch/cuda.h>
-
-using namespace LAMMPS_NS;
-
-template<typename T, class DeviceType>
-using UnmanagedView = Kokkos::View<T, Kokkos::LayoutRight, DeviceType, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-
-template<typename T, class DeviceType>
-using UnmanagedView = Kokkos::View<T, Kokkos::LayoutRight, DeviceType, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-
-template<class DeviceType>
-MetatomicSystemAdaptorKokkos<DeviceType>::MetatomicSystemAdaptorKokkos(LAMMPS *lmp, MetatomicSystemOptions options):
-    MetatomicSystemAdaptor(lmp, options),
-    device_(KokkosDeviceToTorch<DeviceType>::convert())
-{
-    // MetatomicSystemAdaptor allocate on CPU, move to the right device
-    this->atomic_types_ = this->atomic_types_.to(this->device_);
-
-    auto tensor_options = torch::TensorOptions()
-        .dtype(torch::kFloat64)
-        .device(this->device_)
-        .requires_grad(options_.requires_grad);
-
-    this->strain = torch::eye(3, tensor_options);
-}
-
-template<class DeviceType>
-void MetatomicSystemAdaptorKokkos<DeviceType>::add_nl_request(double cutoff, metatomic_torch::NeighborListOptions request) {
-    if (cutoff > options_.interaction_range) {
-        error->one(FLERR,
-            "Invalid metatomic model: one of the requested neighbor lists "
-            "has a cutoff ({}) larger than the model interaction range ({})",
-            cutoff, options_.interaction_range
-        );
-    } else if (cutoff < 0 || !std::isfinite(cutoff)) {
-        error->one(FLERR,
-            "model requested an invalid cutoff for neighbors list: {} "
-            "(cutoff in model units is {})",
-            cutoff, request->cutoff()
-        );
-    }
-
-    nl_requests_kk_.push_back({
-        cutoff,
-        request,
-        /*samples = */ {},
-        /*distances_f64 = */ {},
-        /*distances_f32 = */ {},
-    });
-}
-
-KOKKOS_INLINE_FUNCTION
-Kokkos::Array<int32_t, 3> cell_shifts(
-    const Kokkos::View<double**, Kokkos::LayoutRight, LMPDeviceType>& cell_inv,
-    const double pair_shift[3]
-) {
-    auto shift_a = static_cast<int32_t>(std::round(
-            cell_inv(0, 0) * pair_shift[0] +
-            cell_inv(1, 0) * pair_shift[1] +
-            cell_inv(2, 0) * pair_shift[2]
-    ));
-    auto shift_b = static_cast<int32_t>(std::round(
-        cell_inv(0, 1) * pair_shift[0] +
-        cell_inv(1, 1) * pair_shift[1] +
-        cell_inv(2, 1) * pair_shift[2]
-    ));
-    auto shift_c = static_cast<int32_t>(std::round(
-        cell_inv(0, 2) * pair_shift[0] +
-        cell_inv(1, 2) * pair_shift[1] +
-        cell_inv(2, 2) * pair_shift[2]
-    ));
-    return {shift_a, shift_b, shift_c};
-}
-
-
-
-template<class DeviceType>
-void MetatomicSystemAdaptorKokkos<DeviceType>::setup_neighbors_kk(metatomic_torch::System& system, NeighListKokkos<DeviceType>* list) {
-    auto _ = MetatomicTimer("converting kokkos neighbors list");
-
-    auto dtype = system->positions().scalar_type();
-    auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
-    auto max_number_of_neighbors = list->maxneighs;
-
-    auto d_original_atom_id = Kokkos::View<int*, Kokkos::LayoutRight, LMPDeviceType>("", original_atom_id_.size());
-    Kokkos::deep_copy(
-        d_original_atom_id,
-        UnmanagedView<int*, LMPHostType>(original_atom_id_.data(), original_atom_id_.size())
-    );
-
-    auto d_lmp_to_mta = Kokkos::View<int*, Kokkos::LayoutRight, LMPDeviceType>("", lmp_to_mta_.size());
-    Kokkos::deep_copy(
-        d_lmp_to_mta,
-        UnmanagedView<int*, LMPHostType>(lmp_to_mta_.data(), lmp_to_mta_.size())
-    );
-
-    auto cell_inv = this->cell_inverse();
-    auto d_cell_inv = Kokkos::View<double**, Kokkos::LayoutRight, LMPDeviceType>("cell_inv", 3, 3);
-    Kokkos::deep_copy(
-        d_cell_inv,
-        UnmanagedView<double**, LMPHostType>(reinterpret_cast<double*>(cell_inv.data()), 3, 3)
-    );
-
-    auto x = atomKK->k_x.view<DeviceType>();
-    for (auto& nl: nl_requests_kk_) {
-        auto cutoff2 = nl.cutoff * nl.cutoff;
-        auto full_list = nl.options->full_list();
-
-        auto cutoff_ratio = nl.cutoff / options_.interaction_range;
-        size_t max_n_pairs = static_cast<size_t>(total_n_atoms) * list->maxneighs;
-        // Allocate for a much smaller number of pairs to avoid wasting memory
-        // (especially when the interaction range is much larger than the NL
-        // cutoff)
-        auto pairs_capacity = std::max(
-            std::max(
-                static_cast<size_t>(max_n_pairs * cutoff_ratio / 1000),
-                100ul
-            ),
-            nl.samples.extent(0)
-        );
-
-        // actual number of pairs we found
-        auto n_pairs = Kokkos::DualView<int64_t, LMPDeviceType>("n_pairs");
-        auto d_n_pairs = n_pairs.view_device();
-        auto h_n_pairs = n_pairs.view_host();
-
-        auto processed_all_pairs = Kokkos::DualView<bool, LMPDeviceType>("processed_all_pairs");
-        auto d_processed_all_pairs = processed_all_pairs.view_device();
-        auto h_processed_all_pairs = processed_all_pairs.view_host();
-
-        Kokkos::deep_copy(h_processed_all_pairs, false);
-        processed_all_pairs.template modify<LMPHostType>();
-        processed_all_pairs.template sync<LMPDeviceType>();
-
-        while (!h_processed_all_pairs()) {
-            {
-                auto _ = MetatomicTimer("allocating caches for kokkos neighbors list (capacity for " + std::to_string(pairs_capacity) + " pairs)");
-                if (nl.samples.extent(0) < pairs_capacity) {
-                    MemoryKokkos::realloc_kokkos(nl.samples, "metatomic:samples", pairs_capacity, 5);
-                }
-
-                if (dtype == torch::kFloat64) {
-                    if (nl.distances_f64.extent(0) < pairs_capacity) {
-                        MemoryKokkos::realloc_kokkos(nl.distances_f64, "metatomic:distances_f64", pairs_capacity, 3);
-                    }
-                } else if (dtype == torch::kFloat32) {
-                    if (nl.distances_f32.extent(0) < pairs_capacity) {
-                        MemoryKokkos::realloc_kokkos(nl.distances_f32, "metatomic:distances_f32", pairs_capacity, 3);
-                    }
-                } else {
-                    // should be unreachable
-                    error->one(FLERR, "invalid dtype, this is a bug");
-                }
-            }
-
-            auto _ = MetatomicTimer("filtering kokkos neighbors list");
-
-            Kokkos::deep_copy(h_n_pairs, 0);
-            n_pairs.template modify<LMPHostType>();
-            n_pairs.template sync<LMPDeviceType>();
-
-            Kokkos::deep_copy(h_processed_all_pairs, true);
-            processed_all_pairs.template modify<LMPHostType>();
-            processed_all_pairs.template sync<LMPDeviceType>();
-
-            auto d_numneigh = list->d_numneigh;
-            auto d_ilist = list->d_ilist;
-            auto d_neighbors = list->d_neighbors;
-
-            Kokkos::parallel_for(
-                Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>(
-                    {0, 0},
-                    {list->inum + list->gnum, max_number_of_neighbors}
-                ),
-                KOKKOS_LAMBDA(size_t ii, size_t jj) {
-                    auto atom_i = d_ilist[ii];
-                    if (jj >= d_numneigh[atom_i]) {
-                        return;
-                    }
-
-                    auto original_atom_i = d_original_atom_id[atom_i];
-                    auto i_is_original = (atom_i == original_atom_i);
-                    auto atom_j = d_neighbors(atom_i, jj) & NEIGHMASK;
-                    auto original_atom_j = d_original_atom_id[atom_j];
-                    auto j_is_original = (atom_j == original_atom_j);
-
-                    if (!full_list && original_atom_i > original_atom_j) {
-                        // Remove extra pairs if the model requested half-lists
-                        return;
-                    }
-
-                    if (!i_is_original && !j_is_original) {
-                        // both atoms are periodic ghosts, skip the pair
-                        return;
-                    }
-
-                    if (!i_is_original && j_is_original) {
-                        // this pair will be accounted for when we will process
-                        // atom_j as the central atom
-                        return;
-                    }
-
-                    double distance[3] = {
-                        x(atom_j, 0) - x(atom_i, 0),
-                        x(atom_j, 1) - x(atom_i, 1),
-                        x(atom_j, 2) - x(atom_i, 2),
-                    };
-
-                    auto distance2 = (
-                        distance[0] * distance[0] +
-                        distance[1] * distance[1] +
-                        distance[2] * distance[2]
-                    );
-                    if (distance2 > cutoff2) {
-                        // LAMMPS neighbors list contains some pairs after the
-                        // cutoff, we filter them here
-                        return;
-                    }
-
-                    // Compute the cell shift for the pair.
-                    double shift_i[3] = {
-                        x(atom_i, 0) - x(original_atom_i, 0),
-                        x(atom_i, 1) - x(original_atom_i, 1),
-                        x(atom_i, 2) - x(original_atom_i, 2),
-                    };
-                    double shift_j[3] = {
-                        x(atom_j, 0) - x(original_atom_j, 0),
-                        x(atom_j, 1) - x(original_atom_j, 1),
-                        x(atom_j, 2) - x(original_atom_j, 2),
-                    };
-                    double pair_shift[3] = {
-                        shift_j[0] - shift_i[0],
-                        shift_j[1] - shift_i[1],
-                        shift_j[2] - shift_i[2],
-                    };
-                    Kokkos::Array<int32_t, 3> shift = {0, 0, 0};
-                    if (pair_shift[0] != 0 || pair_shift[1] != 0 || pair_shift[2] != 0) {
-                        shift = cell_shifts(d_cell_inv, pair_shift);
-
-                        if (!full_list && original_atom_i == original_atom_j) {
-                            // If a half neighbors list has been requested, do
-                            // not include the same pair between an atom and
-                            // it's periodic image twice with opposite cell
-                            // shifts (e.g. [1, -1, 1] and [-1, 1, -1]).
-                            //
-                            // Instead we pick pairs in the positive plan of
-                            // shifts.
-                            if (shift[0] + shift[1] + shift[2] < 0) {
-                                // drop shifts on the negative half-space
-                                return;
-                            }
-
-                            if ((shift[0] + shift[1] + shift[2] == 0)
-                                && (shift[2] < 0 || (shift[2] == 0 && shift[1] < 0))) {
-                                // drop shifts in the negative half plane or the
-                                // negative shift[1] axis.
-                                //
-                                // See below for a graphical representation: we are
-                                // keeping the shifts indicated with `O` and
-                                // dropping the ones indicated with `X`
-                                //
-                                //  O O O │ O O O
-                                //  O O O │ O O O
-                                //  O O O │ O O O
-                                // ─X─X─X─┼─O─O─O─
-                                //  X X X │ X X X
-                                //  X X X │ X X X
-                                //  X X X │ X X X
-                                return;
-                            }
-                        }
-                    }
-
-                    auto pair_i = Kokkos::atomic_fetch_add(&d_n_pairs(), 1);
-                    if (pair_i >= nl.samples.extent(0)) {
-                        // stop and re-allocate larger arrays
-                        d_processed_all_pairs() = false;
-                        return;
-                    }
-
-                    nl.samples(pair_i, 0) = d_lmp_to_mta[original_atom_i];
-                    nl.samples(pair_i, 1) = d_lmp_to_mta[original_atom_j];
-                    nl.samples(pair_i, 2) = shift[0];
-                    nl.samples(pair_i, 3) = shift[1];
-                    nl.samples(pair_i, 4) = shift[2];
-                    if (dtype == torch::kFloat64) {
-                        nl.distances_f64(pair_i, 0) = distance[0];
-                        nl.distances_f64(pair_i, 1) = distance[1];
-                        nl.distances_f64(pair_i, 2) = distance[2];
-                    } else {
-                        assert(dtype == torch::kFloat32);
-                        nl.distances_f32(pair_i, 0) = static_cast<float>(distance[0]);
-                        nl.distances_f32(pair_i, 1) = static_cast<float>(distance[1]);
-                        nl.distances_f32(pair_i, 2) = static_cast<float>(distance[2]);
-                    }
-                }
-            );
-
-            processed_all_pairs.template modify<LMPDeviceType>();
-            processed_all_pairs.template sync<LMPHostType>();
-            if (!h_processed_all_pairs()) {
-                pairs_capacity *= 2;
-            }
-        }
-
-        n_pairs.template modify<LMPDeviceType>();
-        n_pairs.template sync<LMPHostType>();
-
-        auto samples_values = torch::from_blob(
-            nl.samples.data(), {h_n_pairs(), 5}, torch::TensorOptions().dtype(torch::kInt32).device(this->device_)
-        );
-
-        torch::Tensor distances;
-        if (dtype == torch::kFloat64) {
-            distances = torch::from_blob(
-                nl.distances_f64.data(), {h_n_pairs(), 3, 1}, torch::TensorOptions().dtype(dtype).device(this->device_)
-            );
-        } else if (dtype == torch::kFloat32) {
-            distances = torch::from_blob(
-                nl.distances_f32.data(), {h_n_pairs(), 3, 1}, torch::TensorOptions().dtype(dtype).device(this->device_)
-            );
-        } else {
-            // should be unreachable
-            error->one(FLERR, "invalid dtype, this is a bug");
-        }
-
-        // wrap into metatensor data structures
-        torch::intrusive_ptr<metatensor_torch::LabelsHolder> samples;
-        {
-            auto _ = MetatomicTimer("creating samples Labels (" +  std::to_string(h_n_pairs()) + " pairs)");
-
-            if (options_.check_consistency) {
-                samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-                    std::vector<std::string>{"first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"},
-                    samples_values
-                );
-            } else {
-                samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-                    std::vector<std::string>{"first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"},
-                    samples_values,
-                    metatensor::assume_unique{}
-                );
-            }
-        }
-
-        torch::intrusive_ptr<metatensor_torch::TensorBlockHolder> neighbors;
-        {
-            auto _ = MetatomicTimer("creating neighbors TensorBlock");
-
-            neighbors = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
-                distances,
-                samples,
-                std::vector<metatensor_torch::Labels>{
-                    metatensor_torch::LabelsHolder::create({"xyz"}, {{0}, {1}, {2}})->to(this->device_),
-                },
-                metatensor_torch::LabelsHolder::create({"distance"}, {{0}})->to(this->device_)
-            );
-        }
-
-        {
-            auto _ = MetatomicTimer("registering neighbors in System");
-            metatomic_torch::register_autograd_neighbors(system, neighbors, options_.check_consistency);
-            system->add_neighbor_list(nl.options, neighbors);
-        }
-    }
-}
-
-
-template<class DeviceType>
-metatomic_torch::System MetatomicSystemAdaptorKokkos<DeviceType>::system_from_lmp(
-    NeighList* list,
-    bool do_virial,
-    torch::ScalarType dtype,
-    torch::Device device,
-    const std::map<std::string, torch::intrusive_ptr<metatomic_torch::ModelOutputHolder>>& requested_inputs
-) {
-    auto _ = MetatomicTimer("creating System from LAMMPS-kokkos data");
-    assert(device == this->device_);
-
-    // Sync atom data to the device execution space. Positions (X_MASK) and
-    // types (TYPE_MASK) are read on-device by the neighbor list kernel and
-    // type mapping. Tags (TAG_MASK) are read on the host by
-    // guess_periodic_ghosts(). Without these syncs, device-side views may
-    // contain stale data from a previous timestep.
-    atomKK->sync(ExecutionSpaceFromDevice<DeviceType>::space, X_MASK | TYPE_MASK);
-
-    auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
-
-    atomic_types_.resize_({total_n_atoms});
-    auto atomic_types_kk = UnmanagedView<int32_t*, DeviceType>(atomic_types_.data_ptr<int32_t>(), total_n_atoms);
-    auto type_mapping_kk = UnmanagedView<int32_t*, DeviceType>(options_.types_mapping, atomKK->ntypes + 1);
-    auto types_kk = atomKK->k_type.view<DeviceType>();
-    Kokkos::parallel_for(total_n_atoms, KOKKOS_LAMBDA(int i) {
-        atomic_types_kk(i) = type_mapping_kk(types_kk(i));
-    });
-
-    // atomKK->k_x contains "real" and then ghost atoms, in that order
-    auto k_x = atomKK->k_x.view<DeviceType>();
-    auto tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(this->device_);
-
-    this->positions = torch::from_blob(k_x.data(), {total_n_atoms, 3}, tensor_options);
-
-    auto cell = torch::zeros({3, 3}, tensor_options);
-    cell[0][0] = domain->xprd;
-
-    cell[1][0] = domain->xy;
-    cell[1][1] = domain->yprd;
-
-    cell[2][0] = domain->xz;
-    cell[2][1] = domain->yz;
-    cell[2][2] = domain->zprd;
-
-    // Periodic boundary conditions handling.
-    auto pbc = torch::tensor(
-        {domain->xperiodic, domain->yperiodic, domain->zperiodic},
-        torch::TensorOptions().dtype(torch::kBool).device(this->device_)
-    );
-
-    cell.index_put_(
-        {torch::logical_not(pbc)},
-        torch::tensor({0.0}, tensor_options)
-    );
-
-    // Sync tags and positions to host. Tags are needed by
-    // guess_periodic_ghosts() to build the tag->index maps. Positions are
-    // needed because domain->inside(atom->x[i]) is called on the host to
-    // identify the direct inter-domain ghost vs periodic images.
-    atomKK->sync(ExecutionSpaceFromDevice<LMPHostType>::space, TAG_MASK | X_MASK);
-    this->guess_periodic_ghosts();
-
-    this->mta_to_lmp_tensor = torch::from_blob(
-        mta_to_lmp.data(),
-        {static_cast<int64_t>(mta_to_lmp.size())},
-        torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU)
-    ).to(this->device_);
-
-    // Only keep the atoms which are not periodic images of other atoms
-    this->atomic_types_ = this->atomic_types_.index_select(0, this->mta_to_lmp_tensor);
-    this->positions = this->positions.index_select(0, this->mta_to_lmp_tensor);
-
-    this->positions.set_requires_grad(options_.requires_grad);
-
-    auto system_positions = this->positions.to(dtype).to(device);
-    cell = cell.to(dtype);
-
-    if (do_virial) {
-        auto model_strain = this->strain.to(dtype);
-
-        // scale positions/cell by the strain so that it enters the
-        // computational graph.
-        system_positions = system_positions.matmul(model_strain);
-        cell = cell.matmul(model_strain);
-    }
-
-    auto system = torch::make_intrusive<metatomic_torch::SystemHolder>(
-        atomic_types_,
-        system_positions,
-        cell,
-        pbc
-    );
-
-    auto* kk_list = dynamic_cast<NeighListKokkos<DeviceType>*>(list);
-    assert(kk_list != nullptr);
-    this->setup_neighbors_kk(system, kk_list);
-
-    for (const auto& [name, input]: requested_inputs) {
-        const auto& unit = input->unit().c_str();
-        if (name == "mass" || name == "masses") {
-            add_masses(system, name);
-        } else if (name == "momentum" || name == "momenta") {
-            add_momenta(system, name);
-        } else if (name == "velocity" || name == "velocities") {
-            add_velocities(system, name);
-        } else {
-            error->all(FLERR, "compute metatomic: the model requested an unsupported additional input '{}'", name);
-        }
-    }
-
-    return system;
-}
-
-static metatensor_torch::TensorMap make_per_atom_tensormap(
-    torch::Tensor values,
-    std::string property_name,
-    std::vector<std::string> component_names
-) {
-    assert (values.dim() == static_cast<int64_t>(component_names.size() + 1));
-
-    auto n_atoms = values.size(0);
-    auto device = values.device();
-    auto label_tensor_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
-
-    auto keys = metatensor_torch::LabelsHolder::single()->to(device);
-    auto samples_values = torch::column_stack({
-        torch::zeros(n_atoms, label_tensor_options).unsqueeze(1),
-        torch::arange(n_atoms, label_tensor_options).unsqueeze(1)
-    });
-    auto samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-        std::vector<std::string>{"system", "atom"},
-        samples_values,
-        metatensor::assume_unique{}
-    );
-
-    auto components = std::vector<metatensor_torch::Labels>{};
-    for (size_t axis = 0; axis < component_names.size(); axis++) {
-        auto component_values = torch::arange(values.size(axis + 1), label_tensor_options).unsqueeze(1);
-        auto component = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-            std::vector<std::string>{std::move(component_names[axis])},
-            component_values
-        );
-        components.push_back(component);
-    }
-
-    auto properties = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-        std::vector<std::string>{std::move(property_name)},
-        torch::tensor({{0}}, label_tensor_options)
-    );
-    auto block = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
-        values.unsqueeze(-1),
-        samples,
-        components,
-        properties
-    );
-
-    return torch::make_intrusive<metatensor_torch::TensorMapHolder>(
-        keys,
-        std::vector<metatensor_torch::TensorBlock>{block}
-    );
-}
-
-template<class DeviceType>
-void MetatomicSystemAdaptorKokkos<DeviceType>::add_masses(metatomic_torch::System& system, std::string name) {
-    auto rmass = atomKK->k_rmass.view<DeviceType>();
-    auto mass = atomKK->k_mass.view<DeviceType>();
-    auto type = atomKK->k_type.view<DeviceType>();
-
-    auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
-
-    auto device = system->device();
-    auto dtype = system->scalar_type();
-
-    // Gather masses in a tensor - create directly on device
-    auto float_tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(device);
-    torch::Tensor masses;
-    if (rmass.data()) {
-        // Per-atom masses: create tensor directly from device pointer
-        masses = torch::from_blob(
-            rmass.data(), {total_n_atoms},
-            float_tensor_options.requires_grad(false)
-        );
-    } else {
-        // Type-based masses: map from atom type to mass on device
-        masses = torch::empty({total_n_atoms}, float_tensor_options);
-        auto masses_kk = UnmanagedView<double*, DeviceType>(
-            masses.data_ptr<double>(), total_n_atoms
-        );
-        Kokkos::parallel_for(total_n_atoms, KOKKOS_LAMBDA(int i) {
-            masses_kk[i] = mass[type[i]];
-        });
-    }
-
-    masses = masses.index_select(0, this->mta_to_lmp_tensor);
-
-    auto tensor = make_per_atom_tensormap(masses.to(dtype), "mass", std::vector<std::string>({}));
-
-    auto unit = metatomic_unit_map.at("mass").at(update->unit_style);
-    tensor->set_info("unit", unit);
-
-    assert(name == "mass" || name == "masses");
-    system->add_data(name, tensor);
-}
-
-
-template<class DeviceType>
-void MetatomicSystemAdaptorKokkos<DeviceType>::add_momenta(metatomic_torch::System& system, std::string name) {
-    auto v = atomKK->k_v.view<DeviceType>();
-    auto rmass = atomKK->k_rmass.view<DeviceType>();
-    auto mass = atomKK->k_mass.view<DeviceType>();
-    auto type = atomKK->k_type.view<DeviceType>();
-
-    auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
-
-    auto device = system->device();
-    auto dtype = system->scalar_type();
-
-    // Gather momenta in a tensor - create directly on device
-    auto float_tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(device);
-
-    torch::Tensor momenta = torch::empty({total_n_atoms, 3}, float_tensor_options);
-    auto momenta_kk = UnmanagedView<double**, DeviceType>(
-        momenta.data_ptr<double>(), total_n_atoms, 3
-    );
-    Kokkos::parallel_for(total_n_atoms, KOKKOS_LAMBDA(int i) {
-        auto m_i = rmass.data() ? rmass[i] : mass[type[i]];
-        momenta_kk(i, 0) = m_i * v(i, 0);
-        momenta_kk(i, 1) = m_i * v(i, 1);
-        momenta_kk(i, 2) = m_i * v(i, 2);
-    });
-
-    momenta = momenta.index_select(0, this->mta_to_lmp_tensor);
-
-    auto tensor = make_per_atom_tensormap(momenta.to(dtype), "momentum", {"xyz"});
-
-    auto mass_unit = metatomic_unit_map.at("mass").at(update->unit_style);
-    auto velocity_unit = metatomic_unit_map.at("velocity").at(update->unit_style);
-    tensor->set_info("unit", mass_unit + "*" + velocity_unit);
-
-    assert(name == "momentum" || name == "momenta");
-    system->add_data(name, tensor);
-}
-
-template<class DeviceType>
-void MetatomicSystemAdaptorKokkos<DeviceType>::add_velocities(metatomic_torch::System& system, std::string name) {
-    auto v = atomKK->k_v.view<DeviceType>();
-
-    auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
-
-    auto device = system->device();
-    auto dtype = system->scalar_type();
-
-    // Gather velocities in a tensor - create directly on device
-    auto float_tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(device);
-
-    auto velocities = torch::from_blob(
-        v.data(), {total_n_atoms, 3},
-        float_tensor_options.requires_grad(false)
-    );
-
-    velocities = velocities.index_select(0, mta_to_lmp_tensor);
-    auto tensor = make_per_atom_tensormap(velocities.to(dtype), "velocity", {"xyz"});
-
-    auto unit = metatomic_unit_map.at("velocity").at(update->unit_style);
-    tensor->set_info("unit", unit);
-
-    assert(name == "velocity" || name == "velocities");
-    system->add_data(name, tensor, /*override=*/true);
-}
-
-namespace LAMMPS_NS {
-template class MetatomicSystemAdaptorKokkos<LMPDeviceType>;
-#ifdef LMP_KOKKOS_GPU
-template class MetatomicSystemAdaptorKokkos<LMPHostType>;
-#endif
-}
+// #include "metatomic_system_kokkos.h"
+// #include "memory_kokkos.h"
+// #include "metatomic_timer.h"
+// #include "metatomic_quantities.h"
+//
+// #include "atom_masks.h"
+// #include "atom_kokkos.h"
+// #include "comm.h"
+// #include "domain.h"
+// #include "error.h"
+// #include "update.h"
+//
+// #include <torch/cuda.h>
+//
+// using namespace LAMMPS_NS;
+//
+// template<typename T, class DeviceType>
+// using UnmanagedView = Kokkos::View<T, Kokkos::LayoutRight, DeviceType, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+//
+// template<typename T, class DeviceType>
+// using UnmanagedView = Kokkos::View<T, Kokkos::LayoutRight, DeviceType, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+//
+// template<class DeviceType>
+// MetatomicSystemAdaptorKokkos<DeviceType>::MetatomicSystemAdaptorKokkos(LAMMPS *lmp, MetatomicSystemOptions options):
+//     MetatomicSystemAdaptor(lmp, options),
+//     device_(KokkosDeviceToTorch<DeviceType>::convert())
+// {
+//     // MetatomicSystemAdaptor allocate on CPU, move to the right device
+//     this->atomic_types_ = this->atomic_types_.to(this->device_);
+//
+//     auto tensor_options = torch::TensorOptions()
+//         .dtype(torch::kFloat64)
+//         .device(this->device_)
+//         .requires_grad(options_.requires_grad);
+//
+//     this->strain = torch::eye(3, tensor_options);
+// }
+//
+// template<class DeviceType>
+// void MetatomicSystemAdaptorKokkos<DeviceType>::add_nl_request(double cutoff, metatomic_torch::NeighborListOptions request) {
+//     if (cutoff > options_.interaction_range) {
+//         error->one(FLERR,
+//             "Invalid metatomic model: one of the requested neighbor lists "
+//             "has a cutoff ({}) larger than the model interaction range ({})",
+//             cutoff, options_.interaction_range
+//         );
+//     } else if (cutoff < 0 || !std::isfinite(cutoff)) {
+//         error->one(FLERR,
+//             "model requested an invalid cutoff for neighbors list: {} "
+//             "(cutoff in model units is {})",
+//             cutoff, request->cutoff()
+//         );
+//     }
+//
+//     nl_requests_kk_.push_back({
+//         cutoff,
+//         request,
+//         /*samples = */ {},
+//         /*distances_f64 = */ {},
+//         /*distances_f32 = */ {},
+//     });
+// }
+//
+// KOKKOS_INLINE_FUNCTION
+// Kokkos::Array<int32_t, 3> cell_shifts(
+//     const Kokkos::View<double**, Kokkos::LayoutRight, LMPDeviceType>& cell_inv,
+//     const double pair_shift[3]
+// ) {
+//     auto shift_a = static_cast<int32_t>(std::round(
+//             cell_inv(0, 0) * pair_shift[0] +
+//             cell_inv(1, 0) * pair_shift[1] +
+//             cell_inv(2, 0) * pair_shift[2]
+//     ));
+//     auto shift_b = static_cast<int32_t>(std::round(
+//         cell_inv(0, 1) * pair_shift[0] +
+//         cell_inv(1, 1) * pair_shift[1] +
+//         cell_inv(2, 1) * pair_shift[2]
+//     ));
+//     auto shift_c = static_cast<int32_t>(std::round(
+//         cell_inv(0, 2) * pair_shift[0] +
+//         cell_inv(1, 2) * pair_shift[1] +
+//         cell_inv(2, 2) * pair_shift[2]
+//     ));
+//     return {shift_a, shift_b, shift_c};
+// }
+//
+//
+//
+// template<class DeviceType>
+// void MetatomicSystemAdaptorKokkos<DeviceType>::setup_neighbors_kk(metatomic_torch::System& system, NeighListKokkos<DeviceType>* list) {
+//     auto _ = MetatomicTimer("converting kokkos neighbors list");
+//
+//     auto dtype = system->positions().scalar_type();
+//     auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
+//     auto max_number_of_neighbors = list->maxneighs;
+//
+//     auto d_original_atom_id = Kokkos::View<int*, Kokkos::LayoutRight, LMPDeviceType>("", original_atom_id_.size());
+//     Kokkos::deep_copy(
+//         d_original_atom_id,
+//         UnmanagedView<int*, LMPHostType>(original_atom_id_.data(), original_atom_id_.size())
+//     );
+//
+//     auto d_lmp_to_mta = Kokkos::View<int*, Kokkos::LayoutRight, LMPDeviceType>("", lmp_to_mta_.size());
+//     Kokkos::deep_copy(
+//         d_lmp_to_mta,
+//         UnmanagedView<int*, LMPHostType>(lmp_to_mta_.data(), lmp_to_mta_.size())
+//     );
+//
+//     auto cell_inv = this->cell_inverse();
+//     auto d_cell_inv = Kokkos::View<double**, Kokkos::LayoutRight, LMPDeviceType>("cell_inv", 3, 3);
+//     Kokkos::deep_copy(
+//         d_cell_inv,
+//         UnmanagedView<double**, LMPHostType>(reinterpret_cast<double*>(cell_inv.data()), 3, 3)
+//     );
+//
+//     auto x = atomKK->k_x.view<DeviceType>();
+//     for (auto& nl: nl_requests_kk_) {
+//         auto cutoff2 = nl.cutoff * nl.cutoff;
+//         auto full_list = nl.options->full_list();
+//
+//         auto cutoff_ratio = nl.cutoff / options_.interaction_range;
+//         size_t max_n_pairs = static_cast<size_t>(total_n_atoms) * list->maxneighs;
+//         // Allocate for a much smaller number of pairs to avoid wasting memory
+//         // (especially when the interaction range is much larger than the NL
+//         // cutoff)
+//         auto pairs_capacity = std::max(
+//             std::max(
+//                 static_cast<size_t>(max_n_pairs * cutoff_ratio / 1000),
+//                 100ul
+//             ),
+//             nl.samples.extent(0)
+//         );
+//
+//         // actual number of pairs we found
+//         auto n_pairs = Kokkos::DualView<int64_t, LMPDeviceType>("n_pairs");
+//         auto d_n_pairs = n_pairs.view_device();
+//         auto h_n_pairs = n_pairs.view_host();
+//
+//         auto processed_all_pairs = Kokkos::DualView<bool, LMPDeviceType>("processed_all_pairs");
+//         auto d_processed_all_pairs = processed_all_pairs.view_device();
+//         auto h_processed_all_pairs = processed_all_pairs.view_host();
+//
+//         Kokkos::deep_copy(h_processed_all_pairs, false);
+//         processed_all_pairs.template modify<LMPHostType>();
+//         processed_all_pairs.template sync<LMPDeviceType>();
+//
+//         while (!h_processed_all_pairs()) {
+//             {
+//                 auto _ = MetatomicTimer("allocating caches for kokkos neighbors list (capacity for " + std::to_string(pairs_capacity) + " pairs)");
+//                 if (nl.samples.extent(0) < pairs_capacity) {
+//                     MemoryKokkos::realloc_kokkos(nl.samples, "metatomic:samples", pairs_capacity, 5);
+//                 }
+//
+//                 if (dtype == torch::kFloat64) {
+//                     if (nl.distances_f64.extent(0) < pairs_capacity) {
+//                         MemoryKokkos::realloc_kokkos(nl.distances_f64, "metatomic:distances_f64", pairs_capacity, 3);
+//                     }
+//                 } else if (dtype == torch::kFloat32) {
+//                     if (nl.distances_f32.extent(0) < pairs_capacity) {
+//                         MemoryKokkos::realloc_kokkos(nl.distances_f32, "metatomic:distances_f32", pairs_capacity, 3);
+//                     }
+//                 } else {
+//                     // should be unreachable
+//                     error->one(FLERR, "invalid dtype, this is a bug");
+//                 }
+//             }
+//
+//             auto _ = MetatomicTimer("filtering kokkos neighbors list");
+//
+//             Kokkos::deep_copy(h_n_pairs, 0);
+//             n_pairs.template modify<LMPHostType>();
+//             n_pairs.template sync<LMPDeviceType>();
+//
+//             Kokkos::deep_copy(h_processed_all_pairs, true);
+//             processed_all_pairs.template modify<LMPHostType>();
+//             processed_all_pairs.template sync<LMPDeviceType>();
+//
+//             auto d_numneigh = list->d_numneigh;
+//             auto d_ilist = list->d_ilist;
+//             auto d_neighbors = list->d_neighbors;
+//
+//             Kokkos::parallel_for(
+//                 Kokkos::MDRangePolicy<DeviceType, Kokkos::Rank<2>>(
+//                     {0, 0},
+//                     {list->inum + list->gnum, max_number_of_neighbors}
+//                 ),
+//                 KOKKOS_LAMBDA(size_t ii, size_t jj) {
+//                     auto atom_i = d_ilist[ii];
+//                     if (jj >= d_numneigh[atom_i]) {
+//                         return;
+//                     }
+//
+//                     auto original_atom_i = d_original_atom_id[atom_i];
+//                     auto i_is_original = (atom_i == original_atom_i);
+//                     auto atom_j = d_neighbors(atom_i, jj) & NEIGHMASK;
+//                     auto original_atom_j = d_original_atom_id[atom_j];
+//                     auto j_is_original = (atom_j == original_atom_j);
+//
+//                     if (!full_list && original_atom_i > original_atom_j) {
+//                         // Remove extra pairs if the model requested half-lists
+//                         return;
+//                     }
+//
+//                     if (!i_is_original && !j_is_original) {
+//                         // both atoms are periodic ghosts, skip the pair
+//                         return;
+//                     }
+//
+//                     if (!i_is_original && j_is_original) {
+//                         // this pair will be accounted for when we will process
+//                         // atom_j as the central atom
+//                         return;
+//                     }
+//
+//                     double distance[3] = {
+//                         x(atom_j, 0) - x(atom_i, 0),
+//                         x(atom_j, 1) - x(atom_i, 1),
+//                         x(atom_j, 2) - x(atom_i, 2),
+//                     };
+//
+//                     auto distance2 = (
+//                         distance[0] * distance[0] +
+//                         distance[1] * distance[1] +
+//                         distance[2] * distance[2]
+//                     );
+//                     if (distance2 > cutoff2) {
+//                         // LAMMPS neighbors list contains some pairs after the
+//                         // cutoff, we filter them here
+//                         return;
+//                     }
+//
+//                     // Compute the cell shift for the pair.
+//                     double shift_i[3] = {
+//                         x(atom_i, 0) - x(original_atom_i, 0),
+//                         x(atom_i, 1) - x(original_atom_i, 1),
+//                         x(atom_i, 2) - x(original_atom_i, 2),
+//                     };
+//                     double shift_j[3] = {
+//                         x(atom_j, 0) - x(original_atom_j, 0),
+//                         x(atom_j, 1) - x(original_atom_j, 1),
+//                         x(atom_j, 2) - x(original_atom_j, 2),
+//                     };
+//                     double pair_shift[3] = {
+//                         shift_j[0] - shift_i[0],
+//                         shift_j[1] - shift_i[1],
+//                         shift_j[2] - shift_i[2],
+//                     };
+//                     Kokkos::Array<int32_t, 3> shift = {0, 0, 0};
+//                     if (pair_shift[0] != 0 || pair_shift[1] != 0 || pair_shift[2] != 0) {
+//                         shift = cell_shifts(d_cell_inv, pair_shift);
+//
+//                         if (!full_list && original_atom_i == original_atom_j) {
+//                             // If a half neighbors list has been requested, do
+//                             // not include the same pair between an atom and
+//                             // it's periodic image twice with opposite cell
+//                             // shifts (e.g. [1, -1, 1] and [-1, 1, -1]).
+//                             //
+//                             // Instead we pick pairs in the positive plan of
+//                             // shifts.
+//                             if (shift[0] + shift[1] + shift[2] < 0) {
+//                                 // drop shifts on the negative half-space
+//                                 return;
+//                             }
+//
+//                             if ((shift[0] + shift[1] + shift[2] == 0)
+//                                 && (shift[2] < 0 || (shift[2] == 0 && shift[1] < 0))) {
+//                                 // drop shifts in the negative half plane or the
+//                                 // negative shift[1] axis.
+//                                 //
+//                                 // See below for a graphical representation: we are
+//                                 // keeping the shifts indicated with `O` and
+//                                 // dropping the ones indicated with `X`
+//                                 //
+//                                 //  O O O │ O O O
+//                                 //  O O O │ O O O
+//                                 //  O O O │ O O O
+//                                 // ─X─X─X─┼─O─O─O─
+//                                 //  X X X │ X X X
+//                                 //  X X X │ X X X
+//                                 //  X X X │ X X X
+//                                 return;
+//                             }
+//                         }
+//                     }
+//
+//                     auto pair_i = Kokkos::atomic_fetch_add(&d_n_pairs(), 1);
+//                     if (pair_i >= nl.samples.extent(0)) {
+//                         // stop and re-allocate larger arrays
+//                         d_processed_all_pairs() = false;
+//                         return;
+//                     }
+//
+//                     nl.samples(pair_i, 0) = d_lmp_to_mta[original_atom_i];
+//                     nl.samples(pair_i, 1) = d_lmp_to_mta[original_atom_j];
+//                     nl.samples(pair_i, 2) = shift[0];
+//                     nl.samples(pair_i, 3) = shift[1];
+//                     nl.samples(pair_i, 4) = shift[2];
+//                     if (dtype == torch::kFloat64) {
+//                         nl.distances_f64(pair_i, 0) = distance[0];
+//                         nl.distances_f64(pair_i, 1) = distance[1];
+//                         nl.distances_f64(pair_i, 2) = distance[2];
+//                     } else {
+//                         assert(dtype == torch::kFloat32);
+//                         nl.distances_f32(pair_i, 0) = static_cast<float>(distance[0]);
+//                         nl.distances_f32(pair_i, 1) = static_cast<float>(distance[1]);
+//                         nl.distances_f32(pair_i, 2) = static_cast<float>(distance[2]);
+//                     }
+//                 }
+//             );
+//
+//             processed_all_pairs.template modify<LMPDeviceType>();
+//             processed_all_pairs.template sync<LMPHostType>();
+//             if (!h_processed_all_pairs()) {
+//                 pairs_capacity *= 2;
+//             }
+//         }
+//
+//         n_pairs.template modify<LMPDeviceType>();
+//         n_pairs.template sync<LMPHostType>();
+//
+//         auto samples_values = torch::from_blob(
+//             nl.samples.data(), {h_n_pairs(), 5}, torch::TensorOptions().dtype(torch::kInt32).device(this->device_)
+//         );
+//
+//         torch::Tensor distances;
+//         if (dtype == torch::kFloat64) {
+//             distances = torch::from_blob(
+//                 nl.distances_f64.data(), {h_n_pairs(), 3, 1}, torch::TensorOptions().dtype(dtype).device(this->device_)
+//             );
+//         } else if (dtype == torch::kFloat32) {
+//             distances = torch::from_blob(
+//                 nl.distances_f32.data(), {h_n_pairs(), 3, 1}, torch::TensorOptions().dtype(dtype).device(this->device_)
+//             );
+//         } else {
+//             // should be unreachable
+//             error->one(FLERR, "invalid dtype, this is a bug");
+//         }
+//
+//         // wrap into metatensor data structures
+//         torch::intrusive_ptr<metatensor_torch::LabelsHolder> samples;
+//         {
+//             auto _ = MetatomicTimer("creating samples Labels (" +  std::to_string(h_n_pairs()) + " pairs)");
+//
+//             if (options_.check_consistency) {
+//                 samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
+//                     std::vector<std::string>{"first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"},
+//                     samples_values
+//                 );
+//             } else {
+//                 samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
+//                     std::vector<std::string>{"first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"},
+//                     samples_values,
+//                     metatensor::assume_unique{}
+//                 );
+//             }
+//         }
+//
+//         torch::intrusive_ptr<metatensor_torch::TensorBlockHolder> neighbors;
+//         {
+//             auto _ = MetatomicTimer("creating neighbors TensorBlock");
+//
+//             neighbors = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
+//                 distances,
+//                 samples,
+//                 std::vector<metatensor_torch::Labels>{
+//                     metatensor_torch::LabelsHolder::create({"xyz"}, {{0}, {1}, {2}})->to(this->device_),
+//                 },
+//                 metatensor_torch::LabelsHolder::create({"distance"}, {{0}})->to(this->device_)
+//             );
+//         }
+//
+//         {
+//             auto _ = MetatomicTimer("registering neighbors in System");
+//             metatomic_torch::register_autograd_neighbors(system, neighbors, options_.check_consistency);
+//             system->add_neighbor_list(nl.options, neighbors);
+//         }
+//     }
+// }
+//
+//
+// template<class DeviceType>
+// metatomic_torch::System MetatomicSystemAdaptorKokkos<DeviceType>::system_from_lmp(
+//     NeighList* list,
+//     bool do_virial,
+//     torch::ScalarType dtype,
+//     torch::Device device,
+//     const std::map<std::string, torch::intrusive_ptr<metatomic_torch::ModelOutputHolder>>& requested_inputs
+// ) {
+//     auto _ = MetatomicTimer("creating System from LAMMPS-kokkos data");
+//     assert(device == this->device_);
+//
+//     // Sync atom data to the device execution space. Positions (X_MASK) and
+//     // types (TYPE_MASK) are read on-device by the neighbor list kernel and
+//     // type mapping. Tags (TAG_MASK) are read on the host by
+//     // guess_periodic_ghosts(). Without these syncs, device-side views may
+//     // contain stale data from a previous timestep.
+//     atomKK->sync(ExecutionSpaceFromDevice<DeviceType>::space, X_MASK | TYPE_MASK);
+//
+//     auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
+//
+//     atomic_types_.resize_({total_n_atoms});
+//     auto atomic_types_kk = UnmanagedView<int32_t*, DeviceType>(atomic_types_.data_ptr<int32_t>(), total_n_atoms);
+//     auto type_mapping_kk = UnmanagedView<int32_t*, DeviceType>(options_.types_mapping, atomKK->ntypes + 1);
+//     auto types_kk = atomKK->k_type.view<DeviceType>();
+//     Kokkos::parallel_for(total_n_atoms, KOKKOS_LAMBDA(int i) {
+//         atomic_types_kk(i) = type_mapping_kk(types_kk(i));
+//     });
+//
+//     // atomKK->k_x contains "real" and then ghost atoms, in that order
+//     auto k_x = atomKK->k_x.view<DeviceType>();
+//     auto tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(this->device_);
+//
+//     this->positions = torch::from_blob(k_x.data(), {total_n_atoms, 3}, tensor_options);
+//
+//     auto cell = torch::zeros({3, 3}, tensor_options);
+//     cell[0][0] = domain->xprd;
+//
+//     cell[1][0] = domain->xy;
+//     cell[1][1] = domain->yprd;
+//
+//     cell[2][0] = domain->xz;
+//     cell[2][1] = domain->yz;
+//     cell[2][2] = domain->zprd;
+//
+//     // Periodic boundary conditions handling.
+//     auto pbc = torch::tensor(
+//         {domain->xperiodic, domain->yperiodic, domain->zperiodic},
+//         torch::TensorOptions().dtype(torch::kBool).device(this->device_)
+//     );
+//
+//     cell.index_put_(
+//         {torch::logical_not(pbc)},
+//         torch::tensor({0.0}, tensor_options)
+//     );
+//
+//     // Sync tags and positions to host. Tags are needed by
+//     // guess_periodic_ghosts() to build the tag->index maps. Positions are
+//     // needed because domain->inside(atom->x[i]) is called on the host to
+//     // identify the direct inter-domain ghost vs periodic images.
+//     atomKK->sync(ExecutionSpaceFromDevice<LMPHostType>::space, TAG_MASK | X_MASK);
+//     this->guess_periodic_ghosts();
+//
+//     this->mta_to_lmp_tensor = torch::from_blob(
+//         mta_to_lmp.data(),
+//         {static_cast<int64_t>(mta_to_lmp.size())},
+//         torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU)
+//     ).to(this->device_);
+//
+//     // Only keep the atoms which are not periodic images of other atoms
+//     this->atomic_types_ = this->atomic_types_.index_select(0, this->mta_to_lmp_tensor);
+//     this->positions = this->positions.index_select(0, this->mta_to_lmp_tensor);
+//
+//     this->positions.set_requires_grad(options_.requires_grad);
+//
+//     auto system_positions = this->positions.to(dtype).to(device);
+//     cell = cell.to(dtype);
+//
+//     if (do_virial) {
+//         auto model_strain = this->strain.to(dtype);
+//
+//         // scale positions/cell by the strain so that it enters the
+//         // computational graph.
+//         system_positions = system_positions.matmul(model_strain);
+//         cell = cell.matmul(model_strain);
+//     }
+//
+//     auto system = torch::make_intrusive<metatomic_torch::SystemHolder>(
+//         atomic_types_,
+//         system_positions,
+//         cell,
+//         pbc
+//     );
+//
+//     auto* kk_list = dynamic_cast<NeighListKokkos<DeviceType>*>(list);
+//     assert(kk_list != nullptr);
+//     this->setup_neighbors_kk(system, kk_list);
+//
+//     for (const auto& [name, input]: requested_inputs) {
+//         const auto& unit = input->unit().c_str();
+//         if (name == "mass" || name == "masses") {
+//             add_masses(system, name);
+//         } else if (name == "momentum" || name == "momenta") {
+//             add_momenta(system, name);
+//         } else if (name == "velocity" || name == "velocities") {
+//             add_velocities(system, name);
+//         } else {
+//             error->all(FLERR, "compute metatomic: the model requested an unsupported additional input '{}'", name);
+//         }
+//     }
+//
+//     return system;
+// }
+//
+// static metatensor_torch::TensorMap make_per_atom_tensormap(
+//     torch::Tensor values,
+//     std::string property_name,
+//     std::vector<std::string> component_names
+// ) {
+//     assert (values.dim() == static_cast<int64_t>(component_names.size() + 1));
+//
+//     auto n_atoms = values.size(0);
+//     auto device = values.device();
+//     auto label_tensor_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+//
+//     auto keys = metatensor_torch::LabelsHolder::single()->to(device);
+//     auto samples_values = torch::column_stack({
+//         torch::zeros(n_atoms, label_tensor_options).unsqueeze(1),
+//         torch::arange(n_atoms, label_tensor_options).unsqueeze(1)
+//     });
+//     auto samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
+//         std::vector<std::string>{"system", "atom"},
+//         samples_values,
+//         metatensor::assume_unique{}
+//     );
+//
+//     auto components = std::vector<metatensor_torch::Labels>{};
+//     for (size_t axis = 0; axis < component_names.size(); axis++) {
+//         auto component_values = torch::arange(values.size(axis + 1), label_tensor_options).unsqueeze(1);
+//         auto component = torch::make_intrusive<metatensor_torch::LabelsHolder>(
+//             std::vector<std::string>{std::move(component_names[axis])},
+//             component_values
+//         );
+//         components.push_back(component);
+//     }
+//
+//     auto properties = torch::make_intrusive<metatensor_torch::LabelsHolder>(
+//         std::vector<std::string>{std::move(property_name)},
+//         torch::tensor({{0}}, label_tensor_options)
+//     );
+//     auto block = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
+//         values.unsqueeze(-1),
+//         samples,
+//         components,
+//         properties
+//     );
+//
+//     return torch::make_intrusive<metatensor_torch::TensorMapHolder>(
+//         keys,
+//         std::vector<metatensor_torch::TensorBlock>{block}
+//     );
+// }
+//
+// template<class DeviceType>
+// void MetatomicSystemAdaptorKokkos<DeviceType>::add_masses(metatomic_torch::System& system, std::string name) {
+//     auto rmass = atomKK->k_rmass.view<DeviceType>();
+//     auto mass = atomKK->k_mass.view<DeviceType>();
+//     auto type = atomKK->k_type.view<DeviceType>();
+//
+//     auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
+//
+//     auto device = system->device();
+//     auto dtype = system->scalar_type();
+//
+//     // Gather masses in a tensor - create directly on device
+//     auto float_tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+//     torch::Tensor masses;
+//     if (rmass.data()) {
+//         // Per-atom masses: create tensor directly from device pointer
+//         masses = torch::from_blob(
+//             rmass.data(), {total_n_atoms},
+//             float_tensor_options.requires_grad(false)
+//         );
+//     } else {
+//         // Type-based masses: map from atom type to mass on device
+//         masses = torch::empty({total_n_atoms}, float_tensor_options);
+//         auto masses_kk = UnmanagedView<double*, DeviceType>(
+//             masses.data_ptr<double>(), total_n_atoms
+//         );
+//         Kokkos::parallel_for(total_n_atoms, KOKKOS_LAMBDA(int i) {
+//             masses_kk[i] = mass[type[i]];
+//         });
+//     }
+//
+//     masses = masses.index_select(0, this->mta_to_lmp_tensor);
+//
+//     auto tensor = make_per_atom_tensormap(masses.to(dtype), "mass", std::vector<std::string>({}));
+//
+//     auto unit = metatomic_unit_map.at("mass").at(update->unit_style);
+//     tensor->set_info("unit", unit);
+//
+//     assert(name == "mass" || name == "masses");
+//     system->add_data(name, tensor);
+// }
+//
+//
+// template<class DeviceType>
+// void MetatomicSystemAdaptorKokkos<DeviceType>::add_momenta(metatomic_torch::System& system, std::string name) {
+//     auto v = atomKK->k_v.view<DeviceType>();
+//     auto rmass = atomKK->k_rmass.view<DeviceType>();
+//     auto mass = atomKK->k_mass.view<DeviceType>();
+//     auto type = atomKK->k_type.view<DeviceType>();
+//
+//     auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
+//
+//     auto device = system->device();
+//     auto dtype = system->scalar_type();
+//
+//     // Gather momenta in a tensor - create directly on device
+//     auto float_tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+//
+//     torch::Tensor momenta = torch::empty({total_n_atoms, 3}, float_tensor_options);
+//     auto momenta_kk = UnmanagedView<double**, DeviceType>(
+//         momenta.data_ptr<double>(), total_n_atoms, 3
+//     );
+//     Kokkos::parallel_for(total_n_atoms, KOKKOS_LAMBDA(int i) {
+//         auto m_i = rmass.data() ? rmass[i] : mass[type[i]];
+//         momenta_kk(i, 0) = m_i * v(i, 0);
+//         momenta_kk(i, 1) = m_i * v(i, 1);
+//         momenta_kk(i, 2) = m_i * v(i, 2);
+//     });
+//
+//     momenta = momenta.index_select(0, this->mta_to_lmp_tensor);
+//
+//     auto tensor = make_per_atom_tensormap(momenta.to(dtype), "momentum", {"xyz"});
+//
+//     auto mass_unit = metatomic_unit_map.at("mass").at(update->unit_style);
+//     auto velocity_unit = metatomic_unit_map.at("velocity").at(update->unit_style);
+//     tensor->set_info("unit", mass_unit + "*" + velocity_unit);
+//
+//     assert(name == "momentum" || name == "momenta");
+//     system->add_data(name, tensor);
+// }
+//
+// template<class DeviceType>
+// void MetatomicSystemAdaptorKokkos<DeviceType>::add_velocities(metatomic_torch::System& system, std::string name) {
+//     auto v = atomKK->k_v.view<DeviceType>();
+//
+//     auto total_n_atoms = atomKK->nlocal + atomKK->nghost;
+//
+//     auto device = system->device();
+//     auto dtype = system->scalar_type();
+//
+//     // Gather velocities in a tensor - create directly on device
+//     auto float_tensor_options = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+//
+//     auto velocities = torch::from_blob(
+//         v.data(), {total_n_atoms, 3},
+//         float_tensor_options.requires_grad(false)
+//     );
+//
+//     velocities = velocities.index_select(0, mta_to_lmp_tensor);
+//     auto tensor = make_per_atom_tensormap(velocities.to(dtype), "velocity", {"xyz"});
+//
+//     auto unit = metatomic_unit_map.at("velocity").at(update->unit_style);
+//     tensor->set_info("unit", unit);
+//
+//     assert(name == "velocity" || name == "velocities");
+//     system->add_data(name, tensor, /*override=*/true);
+// }
+//
+// namespace LAMMPS_NS {
+// template class MetatomicSystemAdaptorKokkos<LMPDeviceType>;
+// #ifdef LMP_KOKKOS_GPU
+// template class MetatomicSystemAdaptorKokkos<LMPHostType>;
+// #endif
+// }
