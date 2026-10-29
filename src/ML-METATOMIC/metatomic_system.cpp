@@ -192,7 +192,7 @@ void MetatomicSystemAdaptor::add_nl_request(double cutoff, metatomic::PairListOp
 
 // Translate from the metatomic neighbor lists requests to LAMMPS neighbor lists requests
 void MetatomicSystemAdaptor::configure_neighbor_lists(NeighRequest* request, CommonMetatomicData* mta_data, const char* requester) {
-    request->set_cutoff(mta_data->max_cutoff);
+    request->set_cutoff_fixed(mta_data->max_cutoff);
 
     auto mincut = mta_data->max_cutoff + neighbor->skin;
     if (strcmp(requester, "pair metatomic") != 0 && comm->get_comm_cutoff() < mincut) {

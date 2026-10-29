@@ -29,17 +29,14 @@ namespace nlohmann = ::nlohmann_lmp;
 #include "memory.h"
 #include "modify.h"
 #include "error.h"
-#include "group.h"
 #include "force.h"
 #include "update.h"
 #include "neighbor.h"
 #include "neigh_list.h"
-#include "neigh_request.h"
 #include "tokenizer.h"
 #include "comm.h"
 
 #include <vector>
-#include <algorithm>
 
 
 using namespace LAMMPS_NS;

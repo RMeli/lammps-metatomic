@@ -38,12 +38,10 @@ namespace nlohmann = ::nlohmann_lmp;
 #include "memory.h"
 #include "modify.h"
 #include "error.h"
-#include "group.h"
 #include "force.h"
 #include "update.h"
 #include "neighbor.h"
 #include "neigh_list.h"
-#include "neigh_request.h"
 #include "comm.h"
 
 #include <vector>
@@ -176,6 +174,12 @@ FixMetatomic::FixMetatomic(LAMMPS *lmp, int narg, char **arg): Fix(lmp, narg, ar
         type_mapping[i] = parsed_types[i - 1];
     }
 
+    mta_data->load_model(
+        this->lmp,
+        this->model_path.c_str(),
+        this->extensions_directory ? this->extensions_directory->c_str() : nullptr
+    );
+
 
     // FlashMD needs position change delta-q and momenta p
     auto positions = torch::make_intrusive<metatomic_torch::ModelOutputHolder>(
@@ -236,12 +240,6 @@ void FixMetatomic::init() {
     if (!type_mapping) {
         error->all(FLERR, "fix metatomic internal error: type_mapping not initialized");
     }
-
-    mta_data->load_model(
-        this->lmp,
-        this->model_path.c_str(),
-        this->extensions_directory ? this->extensions_directory->c_str() : nullptr
-    );
 
     double model_timestep = mta_data->model->attr("module").toModule().attr("timestep").toTensor().item<double>();
     model_timestep = model_timestep * 1e-3;  // fs to ps (metal units)
@@ -480,6 +478,13 @@ void FixMetatomic::initial_integrate(int /*vflag*/) {
             v[i][2] = v[i][2] - com_velocity_new[2] + com_velocity_old[2];
         }
     }
+}
+
+void FixMetatomic::setup(int vflag) {
+    // Zero the forces computed during setup, as post_force() does every step.
+    // Otherwise initial_integrate() applies them as a velocity kick on the
+    // first step of every run.
+    post_force(vflag);
 }
 
 void FixMetatomic::post_force(int /*vflag*/) {

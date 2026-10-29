@@ -32,7 +32,6 @@ namespace nlohmann = ::nlohmann_lmp;
 #include "domain.h"
 
 #include "neigh_list.h"
-#include "neigh_request.h"
 
 #include <torch/version.h>
 #include <torch/script.h>
