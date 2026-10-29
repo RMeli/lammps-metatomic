@@ -56,8 +56,7 @@ struct CommonMetatomicData {
    std::unique_ptr<metatomic::ExternalModel> model;
    // the path used to load the model
    std::string model_path;
-   // model capabilities, declared by the model
-   metatomic::ModelCapabilities capabilities;
+   std::optional<metatomic::ModelCapabilities> capabilities;
    // // run-time evaluation options, decided by this class
    // metatomic_torch::ModelEvaluationOptions evaluation_options;
 

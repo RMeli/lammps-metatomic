@@ -249,9 +249,10 @@ void PairMetatomic::settings(int argc, char ** argv) {
         }
     }
 
-    // Load the model and get it's capabilities (including supported devices)
+    // Load the model and get its capabilities
     mta_data->load_model(this->lmp, model_path, extensions_directory);
-    const auto& outputs = mta_data->capabilities.outputs();
+
+    const auto& outputs = mta_data->capabilities->outputs();
 
     // Set and resolve the variants to use
     auto v_energy = variant_energy ? normalize_variant(variant_energy) : normalize_variant(variant);

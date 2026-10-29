@@ -46,17 +46,7 @@ static std::string device_name(metatomic::ModelCapabilities::Device device) {
     }
 }
 
-CommonMetatomicData::CommonMetatomicData(std::string length_unit):
-    capabilities(
-        metatomic::ModelCapabilities::builder()
-            .atomic_types({})
-            .interaction_range(-1)
-            .length_unit(length_unit)
-            .supported_devices({})
-            .dtype(metatomic::ModelCapabilities::DType::Float32)
-            .outputs({})
-            .build()
-    ) {}
+CommonMetatomicData::CommonMetatomicData([[maybe_unused]] std::string length_unit) {}
 
 PairMetatomicData::PairMetatomicData(std::string length_unit):
     CommonMetatomicData(std::move(length_unit)),
@@ -142,7 +132,10 @@ void CommonMetatomicData::check_requested_device(LAMMPS* lmp, const char* reques
     }
 
     auto wanted = std::string(requested);
-    auto supported = this->capabilities.supported_devices();
+    if (!this->capabilities.has_value()) {
+        lmp->error->one(FLERR, "{}: the model is not loaded yet", cmd_name);
+    }
+    auto supported = this->capabilities->supported_devices();
     auto it = std::find_if(supported.begin(), supported.end(), [&](const auto& d) {
         return device_name(d) == wanted;
     });
@@ -164,7 +157,11 @@ void CommonMetatomicData::check_requested_device(LAMMPS* lmp, const char* reques
 }
 
 DLDataType CommonMetatomicData::model_dtype(LAMMPS* lmp) const {
-    const auto dtype = this->capabilities.dtype();
+    // get model dtype
+    if (!this->capabilities.has_value()) {
+        lmp->error->all(FLERR, "the model is not loaded yet, can not determine the dtype");
+    }
+    const auto dtype = this->capabilities->dtype();
     if (dtype == metatomic::ModelCapabilities::DType::Float64) {
         return DLDataType{kDLFloat, 64, 1};
     } else if (dtype == metatomic::ModelCapabilities::DType::Float32) {
@@ -176,8 +173,11 @@ DLDataType CommonMetatomicData::model_dtype(LAMMPS* lmp) const {
 }
 
 void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
-    // get the model's interaction range in the model length unit
-    auto range = this->capabilities.interaction_range();
+    // get the model interaction range
+    if (!this->capabilities.has_value()) {
+        lmp->error->all(FLERR, "the model is not loaded yet, can not resolve the cutoff");
+    }
+    auto range = this->capabilities->interaction_range();
     // TODO RM: convert the interaction range to LAMMPS units
     if (range < 0) {
         lmp->error->all(FLERR, "interaction_range is negative for this model");
