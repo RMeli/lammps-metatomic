@@ -572,7 +572,7 @@ void PairMetatomic::compute(int eflag, int vflag) {
             results = metatomic::execute_model(
                 *mta_data->model,
                 systems,
-                std::nullopt,  // TODO: selected_atoms from set_selected_atoms
+                mta_data->selected_atoms,
                 requested_outputs,
                 mta_data->check_consistency
             );

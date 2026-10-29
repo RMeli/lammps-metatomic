@@ -199,34 +199,32 @@ void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
     }
 }
 
-// void CommonMetatomicData::set_selected_atoms(Atom* atom, int groupbit) {
-//     int nlocal = atom->nlocal;
-//     int *mask = atom->mask;
-//
-//     int64_t n_selected = 0;
-//     for (int i = 0; i < nlocal; i++) {
-//         if (mask[i] & groupbit) {
-//             n_selected++;
-//         }
-//     }
-//     this->selected_atoms_values_cpu.resize_({n_selected, 2});
-//     auto accessor = this->selected_atoms_values_cpu.accessor<int32_t, 2>();
-//     int64_t idx = 0;
-//     for (int i = 0; i < nlocal; i++) {
-//         if (mask[i] & groupbit) {
-//             accessor[idx][0] = 0;
-//             accessor[idx][1] = i;
-//             idx++;
-//         }
-//     }
-//     this->selected_atoms_values.resize_({n_selected, 2});
-//     this->selected_atoms_values.copy_(this->selected_atoms_values_cpu);
-//
-//     auto selected_atoms = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-//         std::vector<std::string>{"system", "atom"}, this->selected_atoms_values
-//     );
-//     this->evaluation_options->set_selected_atoms(selected_atoms);
-// }
+void CommonMetatomicData::set_selected_atoms(Atom* atom, int groupbit) {
+    int nlocal = atom->nlocal;
+    int *mask = atom->mask;
+
+    int64_t n_selected = 0;
+    for (int i = 0; i < nlocal; i++) {
+        if (mask[i] & groupbit) {
+            n_selected++;
+        }
+    }
+
+    auto samples_values = std::vector<int32_t>(2 * n_selected);
+    int64_t idx = 0;
+    for (int i = 0; i < nlocal; i++) {
+        if (mask[i] & groupbit) {
+            samples_values[2 * idx] = 0;
+            samples_values[2 * idx + 1] = i;
+            idx++;
+        }
+    }
+
+    this->selected_atoms = metatensor::Labels(
+        std::vector<std::string>{"system", "atom"},
+        samples_values.data(), static_cast<size_t>(n_selected)
+    );
+}
 
 std::map<std::string, metatomic::Quantity> CommonMetatomicData::collect_requested_inputs() const {
     std::map<std::string, metatomic::Quantity> input_holders;

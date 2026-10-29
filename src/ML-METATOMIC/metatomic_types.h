@@ -67,10 +67,7 @@ struct CommonMetatomicData {
    // how far away the model needs to know about neighbors
    double max_cutoff = -1;
 
-   // allocation cache for the selected atoms (device)
-   metatomic::DLPackTensor selected_atoms_values;
-   // allocation cache for the selected atoms (CPU)
-   metatomic::DLPackTensor selected_atoms_values_cpu;
+   std::optional<metatensor::Labels> selected_atoms;
 };
 
 struct PairMetatomicData: public CommonMetatomicData {
