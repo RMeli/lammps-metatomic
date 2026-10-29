@@ -13,6 +13,7 @@
 
 /* ----------------------------------------------------------------------
    Contributing authors: Guillaume Fraux <guillaume.fraux@epfl.ch>
+                         Rocco Meli <rocco.meli@cscs.ch>
 ------------------------------------------------------------------------- */
 // metatomic's C++ API uses nlohmann::json; point it at the copy bundled with
 // LAMMPS (renamed to nlohmann_lmp) instead of requiring a second copy
