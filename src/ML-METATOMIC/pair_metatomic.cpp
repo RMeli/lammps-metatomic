@@ -13,6 +13,7 @@
 
 /* ----------------------------------------------------------------------
    Contributing authors: Guillaume Fraux <guillaume.fraux@epfl.ch>
+                         Rocco Meli <rocco.meli@cscs.ch>
 ------------------------------------------------------------------------- */
 #include "pair_metatomic.h"
 #include "metatomic_types.h"

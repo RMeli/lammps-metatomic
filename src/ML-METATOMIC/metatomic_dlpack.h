@@ -11,6 +11,11 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   Contributing authors: Guillaume Fraux <guillaume.fraux@epfl.ch>
+                         Rocco Meli <rocco.meli@cscs.ch>
+------------------------------------------------------------------------- */
+
 #ifndef LMP_METATOMIC_DLPACK_H
 #define LMP_METATOMIC_DLPACK_H
 
