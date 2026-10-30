@@ -83,14 +83,23 @@ void CommonMetatomicData::load_model(
        lmp->error->one(FLERR, "torch model is already loaded");
    }
 
-   std::optional<std::string> extensions = std::nullopt;
+   // The extensions path points to a shared library containing the metatomic
+   // plugins needed to load this model: load & register it before trying to
+   // load the model itself.
    if (extensions_directory != nullptr) {
-       extensions = std::string(extensions_directory);
+       try {
+           metatomic::load_plugin(extensions_directory);
+       } catch (const metatomic::Error& e) {
+           lmp->error->one(FLERR,
+               "failed to load metatomic plugin from extensions at '{}': {}",
+               extensions_directory, e.what()
+           );
+       }
    }
 
    try {
        this->model = std::make_unique<metatomic::ExternalModel>(
-           metatomic::load_model(this->model_path, extensions)
+           metatomic::load_model(this->model_path)
        );
    } catch (const metatomic::Error& e) {
        lmp->error->one(FLERR, "failed to load metatomic model at '{}': {}", path, e.what());
