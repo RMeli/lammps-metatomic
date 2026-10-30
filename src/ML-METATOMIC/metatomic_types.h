@@ -33,7 +33,15 @@ class Atom;
 
 struct CommonMetatomicData {
    CommonMetatomicData(std::string length_unit);
-   void load_model(LAMMPS* lmp, const char* path, const char* extensions_directory);
+   // Load plugin from extensions_directory and model from path
+   // Model options are key-value pairs converted to JSON
+   // TODO: @RM provide "metatomic load_plugin" command instead of extensions directory workaround?
+   void load_model(
+      LAMMPS* lmp,
+      const char* path,
+      const char* extensions_directory,
+      const std::map<std::string, std::string>& model_options = {}
+   );
 
    // check device requested by the user against the supported devices
    void check_requested_device(LAMMPS* lmp, const char* requested, const char* cmd_name) const;

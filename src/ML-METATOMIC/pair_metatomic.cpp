@@ -29,9 +29,11 @@
 
 #include "neigh_list.h"
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <string>
 
 // TODO RM: fix nlohmann
@@ -46,6 +48,21 @@ namespace nlohmann = ::nlohmann_lmp;
 #include "metatomic_quantities.h"
 
 using namespace LAMMPS_NS;
+
+// Keyword recognized by "pair_style metatomic"
+// Used for parsin options (as key-value pairs)
+static bool is_pair_style_metatomic_keyword(const char* word) {
+    static const char* keywords[] = {
+        "check_consistency", "non_conservative", "extensions", "device",
+        "scale", "uncertainty_threshold", "variant", "variant/energy",
+        "variant/energy_uncertainty", "variant/non_conservative_forces",
+        "variant/non_conservative_stress", "options"
+    };
+    for (const auto& keyword: keywords) {
+        if (strcmp(word, keyword) == 0) return true;
+    }
+    return false;
+}
 
 static std::optional<std::string> normalize_variant(const char* variant_string) {
     if (variant_string == nullptr) {
@@ -148,6 +165,7 @@ void PairMetatomic::settings(int argc, char ** argv) {
     const char* model_path = argv[0];
     const char* extensions_directory = nullptr;
     const char* requested_device = nullptr;
+    auto model_options = std::map<std::string, std::string>();
     bool do_uncertainty = true;
     const char* variant = nullptr;
     const char* variant_energy = nullptr;
@@ -244,13 +262,25 @@ void PairMetatomic::settings(int argc, char ** argv) {
             }
             variant_nc_stress = argv[i + 1];
             i += 1;
+        } else if (strcmp(argv[i], "options") == 0) {
+            // parse key-alue pairs until next keyword
+            i += 1;
+            while (i < argc && !is_pair_style_metatomic_keyword(argv[i])) {
+                if (i == argc - 1) {
+                    error->one(FLERR, "expected a value after '{}' in pair_style metatomic options", argv[i]);
+                }
+                model_options[argv[i]] = argv[i + 1];
+                i += 2;
+            }
+            // step back to resume from the keyboard
+            i -= 1;
         } else {
             error->one(FLERR, "unexpected argument to pair_style metatomic: '{}'", argv[i]);
         }
     }
 
     // Load the model and get its capabilities
-    mta_data->load_model(this->lmp, model_path, extensions_directory);
+    mta_data->load_model(this->lmp, model_path, extensions_directory, model_options);
 
     const auto& outputs = mta_data->capabilities->outputs();
 
@@ -521,26 +551,42 @@ void PairMetatomic::compute(int eflag, int vflag) {
     if (eflag_either || need_energy_gradient) {
         auto energy_quantity = mta_data->energy_output;
         if (need_energy_gradient) {
-            // TODO: how to add gradients to an existing Quantity? rebuild it
-            // from the builder with the requested gradients
-            energy_quantity = metatomic::Quantity::builder()
+            // request the gradients that the model supports
+            auto supported_gradients = std::vector<metatomic::Gradients>();
+            auto is_energy = [](const auto& q) {
+                return q.name() == "energy" && q.sample_kind() == metatomic::SampleKind::System;
+            };
+            auto it = std::ranges::find_if(mta_data->capabilities->outputs(), is_energy);
+            if (it != std::ranges::end(mta_data->capabilities->outputs())) {
+                supported_gradients = it->gradients();
+            }
+            auto builder = metatomic::Quantity::builder()
                 .name(energy_quantity.name())
                 .unit(energy_quantity.unit())
-                .sample_kind(metatomic::SampleKind::System)
-                .add_gradient(metatomic::Gradients::Positions)
-                .add_gradient(metatomic::Gradients::Strain)
-                .build();
+                .sample_kind(metatomic::SampleKind::System);
+            for (auto gradient: {metatomic::Gradients::Positions, metatomic::Gradients::Strain}) {
+                if (std::ranges::find(supported_gradients, gradient) != supported_gradients.end()) {
+                    builder.add_gradient(gradient);
+                }
+            }
+            energy_quantity = builder.build();
         }
         requested_outputs.push_back(energy_quantity);
     }
 
-    if (mta_data->uncertainty_threshold > 0) {
+    auto provides = [this](const char* name) {
+        return std::ranges::any_of(mta_data->capabilities->outputs(),
+            [&name](const auto& q) { return q.name() == name; });
+    };
+
+    // only request the energy uncertainty if the model supports such an output
+    if (mta_data->uncertainty_threshold > 0 && provides("energy_uncertainty")) {
         requested_outputs.push_back(mta_data->uncertainty_output);
     }
-    if (do_nc_forces) {
+    if (do_nc_forces && provides("non_conservative_force")) {
         requested_outputs.push_back(mta_data->nc_forces_output);
     }
-    if (do_nc_stress) {
+    if (do_nc_stress && provides("non_conservative_stress")) {
         requested_outputs.push_back(mta_data->nc_stress_output);
     }
 

@@ -56,17 +56,17 @@ PairMetatomicData::PairMetatomicData(std::string length_unit):
         .sample_kind(metatomic::SampleKind::System)
         .build()),
     uncertainty_output(metatomic::Quantity::builder()
-        .name("uncertainty")
+        .name("energy_uncertainty")
         .unit("eV")
         .sample_kind(metatomic::SampleKind::System)
         .build()),
     nc_forces_output(metatomic::Quantity::builder()
-        .name("nc_forces")
+        .name("non_conservative_force")
         .unit("eV/angstrom")
         .sample_kind(metatomic::SampleKind::System)
         .build()),
     nc_stress_output(metatomic::Quantity::builder()
-        .name("nc_stress")
+        .name("non_conservative_stress")
         .unit("eV/angstrom^3")
         .sample_kind(metatomic::SampleKind::System)
         .build()) {}
@@ -74,7 +74,8 @@ PairMetatomicData::PairMetatomicData(std::string length_unit):
 void CommonMetatomicData::load_model(
    LAMMPS* lmp,
    const char* path,
-   const char* extensions_directory
+   const char* extensions_directory,
+   const std::map<std::string, std::string>& model_options
 ) {
    // TODO: seach for the model & extensions inside `$LAMMPS_POTENTIALS`?
 
@@ -97,9 +98,11 @@ void CommonMetatomicData::load_model(
        }
    }
 
+   auto options_json = nlohmann::json(model_options).dump();
+
    try {
        this->model = std::make_unique<metatomic::ExternalModel>(
-           metatomic::load_model(this->model_path)
+           metatomic::load_model(this->model_path, options_json)
        );
    } catch (const metatomic::Error& e) {
        lmp->error->one(FLERR, "failed to load metatomic model at '{}': {}", path, e.what());
