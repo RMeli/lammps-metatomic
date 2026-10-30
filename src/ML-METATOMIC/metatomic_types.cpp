@@ -190,7 +190,7 @@ void CommonMetatomicData::resolve_max_cutoff(LAMMPS* lmp) {
         }
 
         // determine the maximal cutoff in the NL
-        for (const auto& options: this->model->requested_pair_lists()) {
+        for (const auto& options: this->model->requested_pair_lists(this->capabilities->outputs())) {
             auto cutoff = options.cutoff();
             this->max_cutoff = std::max(this->max_cutoff, cutoff);
         }
@@ -226,9 +226,11 @@ void CommonMetatomicData::set_selected_atoms(Atom* atom, int groupbit) {
     );
 }
 
-std::map<std::string, metatomic::Quantity> CommonMetatomicData::collect_requested_inputs() const {
+std::map<std::string, metatomic::Quantity> CommonMetatomicData::collect_requested_inputs(
+    const std::vector<metatomic::Quantity>& requested_outputs
+) const {
     std::map<std::string, metatomic::Quantity> input_holders;
-    for (const auto& quantity: this->model->requested_inputs()) {
+    for (const auto& quantity: this->model->requested_inputs(requested_outputs)) {
         input_holders.emplace(quantity.name(), quantity);
     }
     return input_holders;

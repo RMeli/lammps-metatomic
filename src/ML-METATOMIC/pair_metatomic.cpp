@@ -547,7 +547,7 @@ void PairMetatomic::compute(int eflag, int vflag) {
     auto dtype = mta_data->model_dtype(lmp);
 
     // deal with the model requested inputs
-    auto input_holders = mta_data->collect_requested_inputs();
+    auto input_holders = mta_data->collect_requested_inputs(requested_outputs);
 
     // transform from LAMMPS to metatomic System
     auto system = this->system_adaptor->system_from_lmp(

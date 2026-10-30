@@ -50,7 +50,9 @@ struct CommonMetatomicData {
    void set_selected_atoms(Atom* atom, int groupbit);
 
    // collect the additional inputs requested by the model
-   std::map<std::string, metatomic::Quantity> collect_requested_inputs() const;
+   std::map<std::string, metatomic::Quantity> collect_requested_inputs(
+       const std::vector<metatomic::Quantity>& requested_outputs
+   ) const;
 
    // the metatomic model
    std::unique_ptr<metatomic::ExternalModel> model;

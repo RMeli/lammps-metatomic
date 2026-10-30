@@ -218,7 +218,7 @@ void MetatomicSystemAdaptor::configure_neighbor_lists(NeighRequest* request, Com
 
     // Translate from the metatomic neighbor lists requests to LAMMPS neighbor
     // lists requests.
-    auto requested_nl = mta_data->model->requested_pair_lists();
+    auto requested_nl = mta_data->model->requested_pair_lists(mta_data->capabilities->outputs());
     for (const auto& pair_list_options: requested_nl) {
         // TODO RM
         //auto cutoff = options->engine_cutoff(mta_data->evaluation_options->length_unit());
@@ -580,14 +580,14 @@ void MetatomicSystemAdaptor::setup_neighbors(metatomic::System& system, NeighLis
             distances_vectors = std::unique_ptr<metatensor::DataArrayBase>(
                 new mta::LmpDataArray<double>(
                     reinterpret_cast<double*>(nl.distances_f64.data()),
-                    std::vector<uintptr_t>{n_pairs, 3, 1}
+                    std::vector<uintptr_t>{static_cast<uintptr_t>(n_pairs), 3, 1}
                 )
             );
         } else if (dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1) { // TODO RM
             distances_vectors = std::unique_ptr<metatensor::DataArrayBase>(
                 new mta::LmpDataArray<float>(
                     reinterpret_cast<float*>(nl.distances_f32.data()),
-                    std::vector<uintptr_t>{n_pairs, 3, 1}
+                    std::vector<uintptr_t>{static_cast<uintptr_t>(n_pairs), 3, 1}
                 )
             );
         } else {
